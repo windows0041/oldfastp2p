@@ -2554,6 +2554,10 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                             !c->tunnels[index].lan && !tunnel_ready(&c->tunnels[index]))
                             close_tunnel(c, index, "peer LAN address reachable; trying a direct LAN punch");
                         c->apps[i].tunnel_index = -1;
+                        /* The LAN path is only attempted while the round budget is
+                         * unspent, and earlier WAN attempts have spent it. Reset it
+                         * once: the lan_tried guard keeps this from looping. */
+                        c->apps[i].attempts = 0;
                         c->apps[i].retry = mono();
                     }
                 }
