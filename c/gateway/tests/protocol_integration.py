@@ -61,6 +61,17 @@ def api(path, body=None, jwt=None, connection=None, timeout=3):
     finally:
         if connection is None: conn.close()
 
+GATEWAY_LOG = None
+
+def log_tail(lines=25):
+    if GATEWAY_LOG is None:
+        return '(no gateway log was started)'
+    try:
+        text = Path(GATEWAY_LOG).read_text(errors='replace').strip().splitlines()
+    except OSError as error:
+        return '%s unreadable: %s' % (GATEWAY_LOG, error)
+    return '\n'.join(text[-lines:]) or '(gateway log is empty)'
+
 def wait(check, timeout=10, what='protocol integration step'):
     """Poll until `check` is satisfied, reporting what the last attempt saw.
 
@@ -77,7 +88,8 @@ def wait(check, timeout=10, what='protocol integration step'):
         except (OSError,ValueError) as error:
             last = '%s: %s' % (type(error).__name__, error)
         time.sleep(.05)
-    raise TimeoutError('%s timed out after %ss; last attempt %s' % (what, timeout, last))
+    raise TimeoutError('%s timed out after %ss; last attempt %s; gateway log tail:\n%s'
+                       % (what, timeout, last, log_tail()))
 
 def healthy():
     """The API answers /healthz with 200 once it is serving; anything else is a
@@ -167,6 +179,7 @@ class WS:
 
 try:
     with tempfile.TemporaryDirectory(prefix='fastp2p-c-gateway-protocol-') as temp, (logs/'gateway.log').open('w') as output:
+        GATEWAY_LOG = logs/'gateway.log'
         directory=Path(temp)
         env=os.environ.copy();env.update(FASTP2P_USER=user,FASTP2P_PASSWORD=password,FASTP2P_TOKEN=str(token))
         process=subprocess.Popen([str(Path(args.gateway).resolve()),'--cert',str(certs/'server.crt'),'--key',str(certs/'server.key'),
