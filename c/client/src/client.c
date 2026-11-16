@@ -1534,6 +1534,14 @@ static int tcp_punch_listen(fastp2p_client *c, int index) {
 }
 static void tcp_punch_failed(fastp2p_client *c, int index, uint64_t now) {
     tunnel *t = &c->tunnels[index];
+    {
+        char note[128];
+        int saved = errno;
+        snprintf(note, sizeof(note), "TCP punch attempt %u failed: %s (listener %s)",
+                 t->tcp_attempts, saved ? strerror(saved) : "unknown",
+                 t->listen_fd >= 0 ? "up" : "down");
+        emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
+    }
     if (t->fd >= 0) op_close(t->fd);
     t->fd = -1;
     unsigned limit = t->initiator ? 1 : 5;
@@ -1565,8 +1573,16 @@ static void tcp_punch_dial(fastp2p_client *c, int index, uint64_t now) {
     snprintf(message, sizeof(message), "TCP punch connect attempt %u to %s from %s:%u%s",
              t->tcp_attempts, target, local, (unsigned)t->local_port, t->lan ? " (LAN)" : "");
     emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, message);
-    if (t->fd < 0 || (op_connect(t->fd, &t->peer_addr.u.sa, t->peer_addr.len) && errno != EINPROGRESS))
+    if (t->fd < 0 || (op_connect(t->fd, &t->peer_addr.u.sa, t->peer_addr.len) && errno != EINPROGRESS)) {
+        /* Record why the dial did not even start: refused, unreachable and a full
+         * queue look identical in the retry log otherwise. */
+        char note[128];
+        int saved = errno;
+        snprintf(note, sizeof(note), "TCP punch dial to %s failed: %s", target,
+                 saved ? strerror(saved) : "socket unavailable");
+        emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
         tcp_punch_failed(c, index, now);
+    }
 }
 static void start_underlay(fastp2p_client *c, int index) {
     tunnel *t = &c->tunnels[index];
