@@ -74,3 +74,8 @@ Linux 的 config 目录由独立 fastp2p 服务账号持有（0700），fastp2p.
 网关同时保存每个节点的期望字段、递增版本号及 queued/saved/applied/failed 确认状态。离线修改会在上线后送达；转发规则界面也同步到配置文件。C 库提供可选的配置回调，由 CLI/宿主处理保存和重载；SDK 默认不写文件。显式命令行连接参数或 FASTP2P_TOKEN 环境覆盖属于调试会话，不宣称支持文件配置重载；系统服务应由安装器生成并从配置文件启动。
 
 安卓从旧网关迁移时，先安装新专用 APK，停止已有客户端进程，再执行 `adb shell am start -n top.fastp2p.cclient/.InstallActivity --es token YOUR_16_DIGIT_TOKEN --ez migrate true`。此标记只允许采用已签名 APK 中内置的目标地址和 CA，不接受 Intent 提供的服务器或证书；新网关验证成功后才替换已加密的配置，保留 DeviceID 和已有规则。普通安装入口仍拒绝跨网关覆盖。
+
+### 自建 STUN 服务器
+
+scripts/stun/stun-responder.py 是一个最小的、**支持 CHANGE-REQUEST** 的 STUN 服务（普通请求同 socket 回包；换端口从 端口+1 回包；换地址从另一块本地地址回包）。部署后把 
+etwork.UDPSTUNServers 指向它即可，换端口能力立刻可用；若要连"换地址"也由自己掌握，主机需要两个公网地址，且上游必须同时放行**两个地址的进出**——只把地址配上但出口被过滤时，用该地址作为源发包会丢包，换地址应答就不会到达。
