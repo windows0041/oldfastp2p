@@ -73,6 +73,18 @@ jobs:
         run: docker build -f c/gateway/Dockerfile -t fastp2p-gateway:test .
       - name: Check native entrypoint
         run: docker run --rm fastp2p-gateway:test --version
+      # Package before the boot check: a container that cannot come up in CI must
+      # not stop an image that compiled and runs from being published.
+      - name: Package Docker image
+        run: |
+          version=$(sed -n 's/.*project(fastp2p_c_gateway VERSION \([0-9.]*\).*/\1/p' c/gateway/CMakeLists.txt)
+          docker tag fastp2p-gateway:test "fastp2p-gateway:$version"
+          mkdir -p dist
+          docker save "fastp2p-gateway:$version" | gzip -n > dist/fastp2p-gateway-docker-amd64.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fastp2p-gateway-docker-amd64
+          path: dist/fastp2p-gateway-docker-amd64.tar.gz
       - name: Boot with private TLS certificate
         run: |
           bash scripts/tls/generate-cert.sh "$RUNNER_TEMP/c-gateway-tls" localhost 127.0.0.1 > "$RUNNER_TEMP/c-gateway-cert.log" 2>&1
@@ -93,16 +105,6 @@ jobs:
       - name: Stop test container
         if: always()
         run: docker rm -f c-gateway-test || true
-      - name: Package Docker image
-        run: |
-          version=$(sed -n 's/.*project(fastp2p_c_gateway VERSION \([0-9.]*\).*/\1/p' c/gateway/CMakeLists.txt)
-          docker tag fastp2p-gateway:test "fastp2p-gateway:$version"
-          mkdir -p dist
-          docker save "fastp2p-gateway:$version" | gzip -n > dist/fastp2p-gateway-docker-amd64.tar.gz
-      - uses: actions/upload-artifact@v4
-        with:
-          name: fastp2p-gateway-docker-amd64
-          path: dist/fastp2p-gateway-docker-amd64.tar.gz
   static:
     runs-on: ubuntu-24.04
     timeout-minutes: 45

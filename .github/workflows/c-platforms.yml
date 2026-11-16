@@ -169,6 +169,14 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: windows-validation
+      - name: Package Windows installer exe
+        shell: pwsh
+        run: |
+          Copy-Item build/windows/fastp2p.exe dist/fastp2p-windows-x86_64.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fastp2p-windows-x86_64
+          path: dist/fastp2p-windows-x86_64.exe
       - name: Native Windows protocol, lifecycle, TLS and QUIC tests
         shell: pwsh
         run: |
@@ -227,14 +235,6 @@ jobs:
       # their 16-digit key after downloading, then double-click to install. The
       # Windows SDK (dll/headers) is no longer a Release asset; developers can
       # still get it from the cross job's windows-validation CI artifact.
-      - name: Package Windows installer exe
-        shell: pwsh
-        run: |
-          Copy-Item build/windows/fastp2p.exe dist/fastp2p-windows-x86_64.exe
-      - uses: actions/upload-artifact@v4
-        with:
-          name: fastp2p-windows-x86_64
-          path: dist/fastp2p-windows-x86_64.exe
   linux:
     runs-on: ubuntu-24.04
     container:
@@ -260,6 +260,17 @@ jobs:
           cmake -S c/gateway -B build/c-gateway -G Ninja -DCMAKE_BUILD_TYPE=Debug -DFASTP2P_SANITIZE=ON
           cmake --build build/c-gateway --parallel 3
           ctest --test-dir build/c-gateway --output-on-failure
+      - name: Package native C client SDK
+        run: |
+          cmake -S c/client -B build/client-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DFASTP2P_DEPS_ROOT="$HOME/fastp2p-dev/cross/prefix/linux-x86_64" -DCMAKE_INSTALL_PREFIX="$PWD/dist/sdk-linux-x86_64"
+          cmake --build build/client-release --parallel 3
+          cmake --install build/client-release
+          python3 c/client/scripts/sdk-metadata.py --sdk dist/sdk-linux-x86_64
+          tar -C dist -czf dist/fastp2p-sdk-linux-x86_64.tar.gz sdk-linux-x86_64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fastp2p-sdk-linux-x86_64
+          path: dist/fastp2p-sdk-linux-x86_64.tar.gz
       - name: TCP punching through two filtered NAT routers with UDP blocked
         run: unshare --net python3 c/client/tests/tcp_nat3_integration.py --client build/c/fastp2p --gateway build/c-gateway/fastp2p-gateway --logs build/c/tcp-nat3
       - name: Dual-stack registration, per-family NAT levels and an IPv6 tunnel
@@ -313,17 +324,6 @@ jobs:
           FASTP2P_C_BUILD_DIR="$PWD/build/c" \
           FASTP2P_C_GATEWAY_BUILD_DIR="$PWD/build/c-gateway" \
           bash c/client/scripts/check-update.sh
-      - name: Package native C client SDK
-        run: |
-          cmake -S c/client -B build/client-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DFASTP2P_DEPS_ROOT="$HOME/fastp2p-dev/cross/prefix/linux-x86_64" -DCMAKE_INSTALL_PREFIX="$PWD/dist/sdk-linux-x86_64"
-          cmake --build build/client-release --parallel 3
-          cmake --install build/client-release
-          python3 c/client/scripts/sdk-metadata.py --sdk dist/sdk-linux-x86_64
-          tar -C dist -czf dist/fastp2p-sdk-linux-x86_64.tar.gz sdk-linux-x86_64
-      - uses: actions/upload-artifact@v4
-        with:
-          name: fastp2p-sdk-linux-x86_64
-          path: dist/fastp2p-sdk-linux-x86_64.tar.gz
       - name: Gather sanitized SOCKS5 summaries
         if: always()
         run: |
