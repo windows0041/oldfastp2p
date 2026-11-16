@@ -28,6 +28,7 @@ for name in ['cert','key','bind','apibind','enrollment-ca','database']:
 p.add_argument('--port',type=int,default=27183);p.add_argument('--apiport',type=int,default=10008)
 args=p.parse_args();key=int(os.environ['FASTP2P_TOKEN']);user=os.environ['FASTP2P_USER'];password=os.environ['FASTP2P_PASSWORD']
 nodes={};configs={};lock=threading.RLock();stopped=threading.Event();jwt=secrets.token_urlsafe(32)
+rules_by_node={}
 def merge(base,fields):
     result=json.loads(json.dumps(base))
     for name,value in fields.items():
@@ -72,6 +73,16 @@ class HTTP(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         try:body=json.loads(self.rfile.read(int(self.headers.get('Content-Length','0'))))
         except (ValueError,TypeError):self.reply({},400);return
+        if self.path.startswith('/api/v1/device/') and self.path.endswith('/config'):
+            # Same answer as the real gateway, which no longer pushes configuration.
+            self.reply({},410);return
+        if self.path.startswith('/api/v1/device/') and self.path.endswith('/app'):
+            name=self.path.split('/')[4]
+            with lock:
+                rules_by_node.setdefault(name,[]).append(body)
+                peer=nodes.get(name)
+            if peer:peer.send(packet(3,9,body))
+            self.reply({'error':0});return
         if self.path=='/api/v1/user/login' and body=={'user':user,'password':password}:
             self.reply({'token':jwt,'installToken':str(key),'gateway':{'host':'127.0.0.1','port':args.port,'ca':Path(args.enrollment_ca).read_text() if args.enrollment_ca else ''},'error':0})
         elif self.path.startswith('/api/v1/device/') and self.path.endswith('/config') and self.headers.get('Authorization','')=='Bearer '+jwt:
@@ -85,6 +96,11 @@ class HTTP(http.server.BaseHTTPRequestHandler):
         else:self.reply({},401)
     def do_GET(self):
         path=urlsplit(self.path);query=parse_qs(path.query)
+        if path.path.startswith('/api/v1/device/') and path.path.endswith('/config'):
+            self.reply({},410);return
+        if path.path.startswith('/api/v1/device/') and path.path.endswith('/app'):
+            with lock:value=list(rules_by_node.get(path.path.split('/')[4],[]))
+            self.reply({'rules':value,'error':0});return
         if self.headers.get('Upgrade','').lower()=='websocket':
             name=query.get('node',[''])[0]
             if path.path!='/api/v1/login' or query.get('protocol')!=['fastp2p2'] or query.get('token')!=[str(key)] or not 8<=len(name)<=31:
@@ -154,6 +170,12 @@ class HTTP(http.server.BaseHTTPRequestHandler):
             self.metadata=body;self.send(packet(6,7,{}))
             with lock:config=configs.get(self.node)
             if config:self.send(packet(3,19,config))
+            with lock:stored=list(rules_by_node.get(self.node,[]))
+            # Mirror the gateway: RULE_SYNC carries the whole enabled set, and
+            # RULE_APPLY carries each rule, which is what the client writes out.
+            if stored:
+                self.send(packet(3,16,{'Rules':stored}))
+                for rule in stored:self.send(packet(3,9,rule))
         elif main==6 and sub==8:
             with lock:
                 if self.node in configs and configs[self.node]['revision']==body.get('revision'):configs[self.node]['state']=body['state']
