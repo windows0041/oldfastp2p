@@ -5,6 +5,7 @@
 #include "quic.h"
 #include "socks.h"
 #include "stun.h"
+#include "tcp_level.h"
 #include "secure.h"
 #include "tcp_nat.h"
 #include <ctype.h>
@@ -271,6 +272,7 @@ struct fastp2p_client {
     uint16_t stun_port[FP_STUN_MAX_SERVERS];
     int stun_count;
     nat_stun stun;
+    fp_tcp_level tcp_level;
     /* 1 once every family we decided to probe has finished (or timed out), so
      * the login goes out with a complete picture rather than half-way. */
     int nat_settled;
@@ -322,6 +324,7 @@ struct fastp2p_client {
 };
 static void connect_gateway(fastp2p_client *);
 static int nat_level(const fastp2p_client *);
+static int tcp_nat_level(const fastp2p_client *);
 static int refresh_families(fastp2p_client *);
 static void control_message(fastp2p_client *, uint16_t, uint16_t, const uint8_t *, size_t);
 static void close_tunnel(fastp2p_client *, int, const char *);
@@ -3584,6 +3587,7 @@ static void report_client(fastp2p_client *c) {
     op_ju(j, "tcpNatSamples", c->tcp_nat.family[OP_FAM_V4].samples);
     op_ju(j, "tcpNatDestinationIPs", c->tcp_nat.family[OP_FAM_V4].destinations);
     op_ju(j, "natLevel", (uint64_t)nat_level(c));
+    op_ju(j, "tcpNatLevel", (uint64_t)tcp_nat_level(c));
     report_families(c, j);
     ws_json(c, 6, 0, j);
     json_object_put(j);
@@ -3595,6 +3599,7 @@ static void report_nat(fastp2p_client *c) {
     op_ju(j, "tcpNatSamples", c->tcp_nat.family[OP_FAM_V4].samples);
     op_ju(j, "tcpNatDestinationIPs", c->tcp_nat.family[OP_FAM_V4].destinations);
     op_ju(j, "natLevel", (uint64_t)nat_level(c));
+    op_ju(j, "tcpNatLevel", (uint64_t)tcp_nat_level(c));
     report_families(c, j);
     /* NAT refresh must not replay gateway rules or managed configuration. */
     ws_json(c, 6, 9, j); /* 6/8 is reserved for managed configuration ACKs. */
@@ -3969,6 +3974,18 @@ static void tick_nat_family(fastp2p_client *c, int family, uint64_t now) {
  * then the same request with CHANGE-REQUEST asking for another port, then for
  * another address. A reply that arrives from a *different* source than the one
  * we addressed is the evidence the NAT's filter let a stranger through. */
+int fp_client_tcp_level_config(fastp2p_client *c, json_object *probe) {
+    if (!c)
+        return FASTP2P_OK;
+    const char *text = NULL;
+    if (probe) {
+        if (!json_object_is_type(probe, json_type_string))
+            return FASTP2P_EINVAL;
+        text = json_object_get_string(probe);
+    }
+    return fp_tcp_level_configure(&c->tcp_level, text) < 0 ? FASTP2P_EINVAL : FASTP2P_OK;
+}
+
 int fp_client_stun_config(fastp2p_client *c, json_object *servers) {
     if (!c || !servers)
         return FASTP2P_OK;
@@ -4212,6 +4229,14 @@ static void nat_stun_step(fastp2p_client *c, uint64_t now) {
  * inbound-filtering refinement. 5 means "cone, but the filtering test could not be
  * completed" (no second node to answer from a foreign address): claiming NAT1 or
  * NAT2 there would be a guess, so it is reported as its own value. */
+/* TCP level: the mapping settles symmetric, the callback probe settles the cones. */
+static int tcp_nat_level(const fastp2p_client *c) {
+    if (c->tcp_nat.family[OP_FAM_V4].type == FP_NAT_DEPENDENT)
+        return 4;
+    if (c->tcp_level.level >= 1 && c->tcp_level.level <= 3)
+        return c->tcp_level.level;
+    return 0; /* mapping measured, filtering not */
+}
 static int nat_level(const fastp2p_client *c) {
     const nat_discovery *n = &c->nat[OP_FAM_V4];
     if (n->type == NAT_UNKNOWN)
@@ -4356,6 +4381,7 @@ int fastp2p_client_create(const fastp2p_config *cfg, fastp2p_client **out) {
         c->nat[family].phase = 0;
     }
     fp_tcp_nat_init(&c->tcp_nat);
+    c->tcp_level.listener = c->tcp_level.dialer = -1;
     c->force_relay = getenv("FASTP2P_FORCE_RELAY") != NULL;
     /* Diagnostic only: pretend the probe classified us differently, so the punch
      * ladder and the port window can be exercised without a matching NAT. */
@@ -4623,6 +4649,13 @@ int fastp2p_client_step(fastp2p_client *c, unsigned wait_ms) {
      * result is reported over 6/9, so it never delays the login itself. */
     nat_stun_start(c);
     nat_stun_step(c, now);
+    /* TCP filtering probe: same window, verdict arrives asynchronously. */
+    if (c->tcp_level.phase == 0 && c->tcp_level.server.len && c->ws && c->login_ok)
+        fp_tcp_level_start(&c->tcp_level);
+    int tcp_before = c->tcp_level.level;
+    fp_tcp_level_step(&c->tcp_level, now);
+    if (c->tcp_level.level != tcp_before && c->ws && c->login_ok)
+        report_nat(c);
     tick_accept(c, now);
     for (int i = 0; i < NT; ++i)
         tick_tunnel(c, i, now);

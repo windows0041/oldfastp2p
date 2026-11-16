@@ -31,7 +31,8 @@ static int nat_columns(sqlite3 *db) {
                                      {"tcp_nat6_samples", 0},
                                      {"tcp_nat6_ips", 0},
                                      {"families", 1},
-                                     {"nat_level", 0}};
+                                     {"nat_level", 0},
+ {"tcp_level", 0}};
     for (unsigned i = 0; i < sizeof(columns) / sizeof(columns[0]); ++i) {
         sqlite3_stmt *s = NULL;
         if (sqlite3_prepare_v2(db, "PRAGMA table_info(nodes)", -1, &s, NULL) != SQLITE_OK) return -1;
@@ -99,7 +100,7 @@ int gw_store_open(sqlite3 **out, const char *path) {
                 "CREATE TABLE IF NOT EXISTS node_configs(node TEXT PRIMARY KEY,fields TEXT NOT NULL,"
                 "revision INTEGER NOT NULL,state TEXT NOT NULL,ack_revision INTEGER NOT NULL);"
                 "PRAGMA application_id=1179660880;") || nat_columns(db) ||
-        sql(db, "PRAGMA user_version=7; UPDATE nodes SET online=0; COMMIT;"))
+        sql(db, "PRAGMA user_version=8; UPDATE nodes SET online=0; COMMIT;"))
         goto fail;
     *out = db;
     return 0;
@@ -295,7 +296,7 @@ int gw_store_save(sqlite3 *db, const struct connection *node, int online) {
                        "mac=CASE WHEN ?<>'' THEN ? ELSE mac END,os=CASE WHEN ?<>'' THEN ? ELSE os END,"
                        "version=CASE WHEN ?<>'' THEN ? ELSE version END,"
                        "hostname=CASE WHEN ?<>'' THEN ? ELSE hostname END,nat=?,tcp_nat=?,tcp_nat_samples=?,tcp_nat_ips=?,"
-                       "nat6=?,tcp_nat6=?,tcp_nat6_samples=?,tcp_nat6_ips=?,families=?,nat_level=?,bandwidth=?,last_seen=?,"
+                       "nat6=?,tcp_nat6=?,tcp_nat6_samples=?,tcp_nat6_ips=?,families=?,nat_level=?,tcp_level=?,bandwidth=?,last_seen=?,"
                        "online=?,last_offline=CASE WHEN ?=0 THEN ? ELSE last_offline END WHERE name=?";
     if (sqlite3_prepare_v2(db, text, -1, &statement, NULL) != SQLITE_OK)
         return -1;
@@ -322,6 +323,7 @@ int gw_store_save(sqlite3 *db, const struct connection *node, int online) {
                      node->families & (GW_FAMILY_V4 | GW_FAMILY_V6) ? (int)node->families : 1);
     /* 1..4 are the levels, 5 is "cone, filtering untestable", 0 unknown. */
     sqlite3_bind_int(statement, parameter++, node->nat_level <= 5 ? (int)node->nat_level : 0);
+    sqlite3_bind_int(statement, parameter++, node->tcp_level <= 4 ? (int)node->tcp_level : 0);
     sqlite3_bind_int(statement, parameter++, (int)node->bandwidth);
     sqlite3_bind_int64(statement, parameter++, (sqlite3_int64)(node->last_seen_wall / 1000000000));
     sqlite3_bind_int(statement, parameter++, online);
@@ -373,7 +375,7 @@ json_object *gw_store_list(sqlite3 *db, const char *search, unsigned limit, unsi
     uint64_t total = (uint64_t)sqlite3_column_int64(statement, 0);
     sqlite3_finalize(statement);
     statement = NULL;
-    snprintf(query, sizeof(query), "SELECT name,node_id,hostname,ip,ipv6,lanip,mac,os,version,nat,bandwidth,first_seen,last_seen,last_offline,online,tcp_nat,tcp_nat_samples,tcp_nat_ips,nat6,tcp_nat6,tcp_nat6_samples,tcp_nat6_ips,families,nat_level FROM nodes%s ORDER BY online DESC,name LIMIT ?2 OFFSET ?3", where);
+    snprintf(query, sizeof(query), "SELECT name,node_id,hostname,ip,ipv6,lanip,mac,os,version,nat,bandwidth,first_seen,last_seen,last_offline,online,tcp_nat,tcp_nat_samples,tcp_nat_ips,nat6,tcp_nat6,tcp_nat6_samples,tcp_nat6_ips,families,nat_level,tcp_level FROM nodes%s ORDER BY online DESC,name LIMIT ?2 OFFSET ?3", where);
     if (sqlite3_prepare_v2(db, query, -1, &statement, NULL) != SQLITE_OK)
         return NULL;
     sqlite3_bind_text(statement, 1, pattern, -1, SQLITE_TRANSIENT);
@@ -400,6 +402,7 @@ json_object *gw_store_list(sqlite3 *db, const char *search, unsigned limit, unsi
         gw_ju(node, "tcpNatSamples6", (uint64_t)sqlite3_column_int(statement, 20));
         gw_ju(node, "tcpNatDestinationIPs6", (uint64_t)sqlite3_column_int(statement, 21));
         gw_ju(node, "natLevel", (uint64_t)sqlite3_column_int(statement, 23));
+        gw_ju(node, "tcpNatLevel", (uint64_t)sqlite3_column_int(statement, 24));
         {
             int families = sqlite3_column_int(statement, 22);
             gw_ju(node, "families", (uint64_t)(families & (GW_FAMILY_V4 | GW_FAMILY_V6)

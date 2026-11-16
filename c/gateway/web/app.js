@@ -20,6 +20,11 @@
    * its source port unchanged yet dropped every unsolicited SYN, which reads as
    * NAT3 on UDP. */
   const tcpMapping = value => ({1: '映射稳定', 2: '映射随目标'}[Number(value)] || '未知');
+  /* tcpNatLevel is the callback probe's verdict; until it runs the node only
+   * reports a mapping observation, so that wording is the fallback. */
+  const tcpLabel = node => Number(node.tcpNatLevel)
+    ? ({1: 'NAT1', 2: 'NAT2', 3: 'NAT3', 4: 'NAT4'}[Number(node.tcpNatLevel)] || '未知')
+    : tcpMapping(node.tcpNatType);
   const natDetail = value =>
     ({1: '映射与目标无关', 2: '对称（端口随机）', 3: '对称（端口递增）', 4: '对称（端口递减）'}[Number(value)] || '探测未完成');
   const hasFamily = (node, bit) => (Number(node.families) || 1) & bit;
@@ -116,11 +121,11 @@
       /* Only IPv4 is shown: with IPv6 there is normally no NAT to classify, so a
        * second pair of levels would be noise rather than information. */
       nat.append(element('span', '', 'UDP：' + udpLevel(n)),
-        element('small', 'node-subtitle', 'TCP：' + tcpMapping(n.tcpNatType)));
+        element('small', 'node-subtitle', 'TCP：' + tcpLabel(n)));
       nat.title = 'UDP ' + udpLevel(n) +
         '：NAT1 全锥／NAT2 地址受限／NAT3 端口受限／NAT4 对称。' +
         '（映射观测：' + natDetail(n.udpNatType) + '；探测端口 ' + (Number(n.publicIPPort) || 0) + '）' +
-        'TCP ' + tcpMapping(n.tcpNatType) + '：只测映射稳定性（' +
+        'TCP ' + tcpLabel(n) + '：（' +
         (Number(n.tcpNatSamples) || 0) + ' 个样本，' + (Number(n.tcpNatDestinationIPs) || 0) +
         ' 个目标 IP），未做入站过滤探测。' +
         (Number(n.natLevel) === 5 ? ' NAT1/2 表示映射为锥形，但当时没有第二个节点可用于区分是否接受陌生来源。' : '');

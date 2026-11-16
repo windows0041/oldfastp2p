@@ -183,6 +183,17 @@ static int nat_fields(struct connection *c, json_object *j) {
             return -1;
         c->nat_level = (unsigned)n;
     }
+    /* tcpNatLevel is the TCP filtering verdict from the callback probe: 1..4, or
+     * 0 when the mapping is known but no probe server answered. */
+    json_object *tcp_level = gw_get(j, "tcpNatLevel");
+    if (tcp_level) {
+        if (!json_object_is_type(tcp_level, json_type_int) || json_object_get_int64(tcp_level) < 0)
+            return -1;
+        uint64_t n = json_object_get_uint64(tcp_level);
+        if (n > 4)
+            return -1;
+        c->tcp_level = (unsigned)n;
+    }
     return 0;
 }
 /* The family a relay decision is made for: IPv6 wins whenever both ends can use
@@ -718,6 +729,7 @@ static json_object *devices(void) {
         gw_ju(j, "tcpNatSamples6", n->tcp_nat6_samples);
         gw_ju(j, "tcpNatDestinationIPs6", n->tcp_nat6_ips);
         gw_ju(j, "natLevel", n->nat_level);
+    gw_ju(j, "tcpNatLevel", n->tcp_level);
         gw_ju(j, "families", n->families);
         gw_ju(j, "hasIPv6", n->has_ipv6);
         snprintf(number, sizeof(number), "%u", n->bandwidth);

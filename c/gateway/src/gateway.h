@@ -54,6 +54,7 @@ struct connection {
      * 5 = cone with untestable filtering). Kept apart from `nat`, which stays a
      * pure mapping observation for the relay filter and for old peers. */
     unsigned nat_level;
+    unsigned tcp_level; /* 1..4 TCP filtering verdict, 0 = not measured */
     unsigned observed_family; /* GW_FAMILY_V4 / GW_FAMILY_V6 of this socket */
     unsigned tcp_nat, tcp_nat_samples, tcp_nat_ips;
     unsigned nat6, tcp_nat6, tcp_nat6_samples, tcp_nat6_ips;

@@ -83,6 +83,7 @@ static int create_json(const char *text, const char *token_text, const char *ca,
     rv = fastp2p_client_create(&cfg, out);
     if (!rv) rv = fp_client_tcp_nat_config(*out, op_get(network, "TCPSTUNServers"));
     if (!rv) rv = fp_client_stun_config(*out, op_get(network, "UDPSTUNServers"));
+    if (!rv) rv = fp_client_tcp_level_config(*out, op_get(network, "TCPNatProbe"));
     if (!rv && validate) fp_client_validation_mode(*out);
     /* Android cannot replace its own package, so the embedding app names a
      * writable directory here for staging a downloaded upgrade. */
