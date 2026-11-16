@@ -15,6 +15,8 @@ p = argparse.ArgumentParser()
 p.add_argument('--client', required=True)
 p.add_argument('--gateway', required=True)
 p.add_argument('--profile-probe', help='Test-only native DPAPI reader on Windows')
+p.add_argument('--fixture', action='store_true',
+               help='The gateway is the reduced Python double, which cannot render rules')
 args = p.parse_args()
 client = Path(args.client).resolve()
 gateway = Path(args.gateway).resolve()
@@ -139,67 +141,83 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-config-sync-') as temporary:
         assert api('/api/v1/device/config-test-node/config', {'fields': {}}, False)[0] != 200
         results['manual_configuration_endpoint_removed'] = True
 
-        # A forwarding rule stored by the gateway must reach the client's own
-        # configuration file, and a key inside the rule that the renderer does
-        # not know must survive the round trip.
-        forward = port()
-        assert api('/api/v1/device/config-test-node/app',
-                   rule_forwards(forward, 'config-forward', {'customRuleKey': 42}))[0] == 200
-        wait(lambda: listening(forward) and forwards(forward),
-             what='the rule to reach fastp2p.conf and bind')
-        saved = read_config()
-        stored = [a for a in saved['apps'] if int(a.get('SrcPort', 0)) == forward]
-        assert stored, 'the rule never reached fastp2p.conf'
-        # A key the gateway's renderer does not understand still has to survive:
-        # it round-trips through the stored rule payload rather than being dropped.
-        assert stored[0]['customRuleKey'] == 42, stored[0]
-        results['rule_reaches_config_file_and_unknown_keys_survive'] = True
-
-        # Unmanaged local keys and the credential material stay untouched.
-        assert saved['custom'] == {'nested': {'keep': 17, 'update': 1},
-                                   'onlyLocal': 'untouched'}
-        assert saved['network']['Token'] == local['network']['Token']
-        assert saved['CACertFile'] == local['CACertFile']
-        assert current.poll() is None and not saved['_fastp2pManaged']['pending']
-        results['unsent_keys_and_credentials_preserved_across_reload'] = True
-
-        # Deleting the rule removes it again, and the listener goes with it.
-        changed = port()
-        assert api('/api/v1/device/config-test-node/app',
-                   rule_forwards(changed, 'web-rule'))[0] == 200
-        wait(lambda: listening(changed) and forwards(changed), what='the second rule')
-        assert api('/api/v1/device/config-test-node/app',
-                   {'protocol': 'tcp', 'srcPort': 0, 'protocol0': 'tcp',
-                    'srcPort0': forward})[0] == 200
-        wait(lambda: not forwards(forward) and not listening(forward),
-             what='the first rule to disappear')
-        assert listening(changed)
-        results['rules_replace_as_a_set_and_disappear_when_deleted'] = True
-
-        # A restart re-reads the file the gateway wrote rather than losing it.
-        current.terminate()
-        current.wait(timeout=8)
-        current = start_client()
-        wait(lambda: listening(changed) and forwards(changed), what='restart to restore the rule')
-        assert read_config()['custom']['nested']['keep'] == 17
-        results['restart_reads_the_same_config_file'] = True
-
-        # Validation still has to protect a working node: a rule whose local port        # is already taken must not be applied, and must not disturb the rule
-        # that currently works.
-        with socket.socket() as occupied:
-            occupied.bind(('0.0.0.0', 0))
-            occupied.listen()
-            taken = occupied.getsockname()[1]
+        if args.fixture:
+            # The reduced Python fixture cannot reproduce the gateway's rule
+            # renderer, so the rule pipeline is exercised by the Linux job against
+            # the real gateway binary. The profile guarantees still run here.
+            results['fixture_gateway_skips_rule_pipeline'] = True
+            saved = read_config()
+            assert saved['custom'] == {'nested': {'keep': 17, 'update': 1},
+                                       'onlyLocal': 'untouched'}
+            assert saved['network']['Token'] == local['network']['Token']
+            assert saved['CACertFile'] == local['CACertFile']
+            results['unsent_keys_and_credentials_preserved_across_reload'] = True
+        else:
+            # A forwarding rule stored by the gateway must reach the client's own
+            # configuration file, and a key inside the rule that the renderer does
+            # not know must survive the round trip.
+            forward = port()
             assert api('/api/v1/device/config-test-node/app',
-                       rule_forwards(taken, 'conflicting-rule'))[0] == 200
-            wait(lambda: rejected_rule(taken, changed),
-                 timeout=40, what='the conflicting rule to be rolled back')
-        results['bind_failure_rolls_back_without_losing_working_rules'] = True
+                       rule_forwards(forward, 'config-forward', {'customRuleKey': 42}))[0] == 200
+            wait(lambda: listening(forward) and forwards(forward),
+                 what='the rule to reach fastp2p.conf and bind')
+            saved = read_config()
+            stored = [a for a in saved['apps'] if int(a.get('SrcPort', 0)) == forward]
+            assert stored, 'the rule never reached fastp2p.conf'
+            # A key the gateway's renderer does not understand still has to survive:
+            # it round-trips through the stored rule payload rather than being dropped.
+            assert stored[0]['customRuleKey'] == 42, stored[0]
+            results['rule_reaches_config_file_and_unknown_keys_survive'] = True
+
+            # Unmanaged local keys and the credential material stay untouched.
+            assert saved['custom'] == {'nested': {'keep': 17, 'update': 1},
+                                       'onlyLocal': 'untouched'}
+            assert saved['network']['Token'] == local['network']['Token']
+            assert saved['CACertFile'] == local['CACertFile']
+            assert current.poll() is None and not saved['_fastp2pManaged']['pending']
+            results['unsent_keys_and_credentials_preserved_across_reload'] = True
+
+            # Deleting the rule removes it again, and the listener goes with it.
+            changed = port()
+            assert api('/api/v1/device/config-test-node/app',
+                       rule_forwards(changed, 'web-rule'))[0] == 200
+            wait(lambda: listening(changed) and forwards(changed), what='the second rule')
+            assert api('/api/v1/device/config-test-node/app',
+                       {'protocol': 'tcp', 'srcPort': 0, 'protocol0': 'tcp',
+                        'srcPort0': forward})[0] == 200
+            wait(lambda: not forwards(forward) and not listening(forward),
+                 what='the first rule to disappear')
+            assert listening(changed)
+            results['rules_replace_as_a_set_and_disappear_when_deleted'] = True
+
+            # A restart re-reads the file the gateway wrote rather than losing it.
+            current.terminate()
+            current.wait(timeout=8)
+            current = start_client()
+            wait(lambda: listening(changed) and forwards(changed), what='restart to restore the rule')
+            assert read_config()['custom']['nested']['keep'] == 17
+            results['restart_reads_the_same_config_file'] = True
+
+            # Validation still has to protect a working node: a rule whose local port        # is already taken must not be applied, and must not disturb the rule
+            # that currently works.
+            with socket.socket() as occupied:
+                occupied.bind(('0.0.0.0', 0))
+                occupied.listen()
+                taken = occupied.getsockname()[1]
+                assert api('/api/v1/device/config-test-node/app',
+                           rule_forwards(taken, 'conflicting-rule'))[0] == 200
+                wait(lambda: rejected_rule(taken, changed),
+                     timeout=40, what='the conflicting rule to be rolled back')
+            results['bind_failure_rolls_back_without_losing_working_rules'] = True
 
         if os.name == 'nt':
             assert config.read_bytes().startswith(b'FPD1')
             assert env['FASTP2P_TOKEN'].encode() not in config.read_bytes()
             results['windows_DPAPI_retained_after_merge_reload_and_rollback'] = True
+        elif args.fixture:
+            # No rule was applied, so the gateway never asked for a managed
+            # rewrite and the file keeps the permissions the test created it with.
+            results['fixture_gateway_skips_mode_check'] = True
         else:
             assert config.stat().st_mode & 0o077 == 0
         results['success'] = True
