@@ -3173,12 +3173,19 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
     if (t->state == T_UNDERLAY && t->notified)
         start_underlay(c, ti);
     if (t->state == T_TCP_CONNECT) {
-        if (t->tcp_v2 && t->fd >= 0 && now >= t->tcp_attempt_deadline)
-            tcp_punch_failed(c, ti, now);
         if (t->state && t->tcp_v2 && t->fd < 0 && t->tcp_retry_at && now >= t->tcp_retry_at)
             tcp_punch_dial(c, ti, now);
         if (!t->state) return;
+        /* Completion first, deadline second. The non-blocking connect often finishes
+         * just as the attempt window closes; judging it by the deadline alone tore
+         * down connections that were still being established - every attempt then
+         * failed with EAGAIN even though both ends were listening. */
         int rv = t->fd >= 0 ? connect_ready(t->fd) : 0;
+        if (rv == 0 && t->tcp_v2 && t->fd >= 0 && now >= t->tcp_attempt_deadline) {
+            errno = ETIMEDOUT;
+            tcp_punch_failed(c, ti, now);
+            if (!t->state) return;
+        }
         if (rv < 0) {
             if (t->tcp_v2) {
                 tcp_punch_failed(c, ti, now);
