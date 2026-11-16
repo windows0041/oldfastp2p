@@ -3978,6 +3978,11 @@ static void tick_nat_family(fastp2p_client *c, int family, uint64_t now) {
  * then the same request with CHANGE-REQUEST asking for another port, then for
  * another address. A reply that arrives from a *different* source than the one
  * we addressed is the evidence the NAT's filter let a stranger through. */
+/* Built-in probe servers: every node measures its NAT the same way without any
+ * per-machine configuration. Both are still overridable, and `[]` / "" disables
+ * the corresponding probe for an operator who does not want it to leave the host. */
+#define FP_DEFAULT_STUN_SERVERS "stun.fastp2p.top:3478"
+
 int fp_client_tcp_level_config(fastp2p_client *c, json_object *probe) {
     if (!c)
         return FASTP2P_OK;
@@ -3988,11 +3993,57 @@ int fp_client_tcp_level_config(fastp2p_client *c, json_object *probe) {
         text = json_object_get_string(probe);
     }
     return fp_tcp_level_configure(&c->tcp_level, text) < 0 ? FASTP2P_EINVAL : FASTP2P_OK;
-}
-
-int fp_client_stun_config(fastp2p_client *c, json_object *servers) {
-    if (!c || !servers)
+}/* Parses one "host:port" entry into slot `count`. Returns 0 on success. */
+static int stun_entry(fastp2p_client *c, const char *text, int count) {
+    size_t length = strlen(text);
+    if (!length || length >= sizeof(c->stun_host[0]))
+        return -1;
+    uint64_t port = 3478;
+    size_t host_length = length;
+    /* "host:port"; a bracketed or bare v6 literal keeps its colons. */
+    const char *colon = strrchr(text, ':');
+    if (colon && !strchr(text, '[') && strchr(text, ':') == colon) {
+        uint64_t parsed = 0;
+        if (!*++colon)
+            return -1;
+        for (const char *p = colon; *p; ++p) {
+            if (*p < '0' || *p > '9')
+                return -1;
+            parsed = parsed * 10 + (uint64_t)(*p - '0');
+            if (parsed > 65535)
+                return -1;
+        }
+        if (!parsed)
+            return -1;
+        port = parsed;
+        host_length = (size_t)(colon - 1 - text);
+    }
+    if (!host_length || host_length >= sizeof(c->stun_host[0]))
+        return -1;
+    memcpy(c->stun_host[count], text, host_length);
+    c->stun_host[count][host_length] = 0;
+    /* A bracketed v6 literal is written [addr] on the wire of the config. */
+    if (c->stun_host[count][0] == '[') {
+        size_t inner = strlen(c->stun_host[count]);
+        if (inner < 3 || c->stun_host[count][inner - 1] != ']')
+            return -1;
+        memmove(c->stun_host[count], c->stun_host[count] + 1, inner - 2);
+        c->stun_host[count][inner - 2] = 0;
+    }
+    c->stun_port[count] = (uint16_t)port;
+    return 0;
+}int fp_client_stun_config(fastp2p_client *c, json_object *servers) {
+    if (!c)
         return FASTP2P_OK;
+    /* No key at all falls back to the built-in server, so a node measures its NAT
+     * without any per-machine configuration. An empty array is an explicit opt-out
+     * for operators who do not want the client to contact anything. */
+    if (!servers) {
+        if (stun_entry(c, FP_DEFAULT_STUN_SERVERS, 0))
+            return FASTP2P_EINVAL;
+        c->stun_count = 1;
+        return FASTP2P_OK;
+    }
     if (!json_object_is_type(servers, json_type_array) ||
         json_object_array_length(servers) > FP_STUN_MAX_SERVERS)
         return FASTP2P_EINVAL;
@@ -4001,48 +4052,14 @@ int fp_client_stun_config(fastp2p_client *c, json_object *servers) {
         json_object *item = json_object_array_get_idx(servers, i);
         if (!json_object_is_type(item, json_type_string))
             return FASTP2P_EINVAL;
-        const char *text = json_object_get_string(item);
-        size_t length = strlen(text);
-        if (!length || length >= sizeof(c->stun_host[0]))
+        if (stun_entry(c, json_object_get_string(item), count))
             return FASTP2P_EINVAL;
-        uint64_t port = 3478;
-        size_t host_length = length;
-        /* "host:port"; a bracketed or bare v6 literal keeps its colons. */
-        const char *colon = strrchr(text, ':');
-        if (colon && !strchr(text, '[') && strchr(text, ':') == colon) {
-            uint64_t parsed = 0;
-            if (!*++colon)
-                return FASTP2P_EINVAL;
-            for (const char *p = colon; *p; ++p) {
-                if (*p < '0' || *p > '9')
-                    return FASTP2P_EINVAL;
-                parsed = parsed * 10 + (uint64_t)(*p - '0');
-                if (parsed > 65535)
-                    return FASTP2P_EINVAL;
-            }
-            if (!parsed)
-                return FASTP2P_EINVAL;
-            port = parsed;
-            host_length = (size_t)(colon - 1 - text);
-        }
-        if (!host_length || host_length >= sizeof(c->stun_host[0]))
-            return FASTP2P_EINVAL;
-        memcpy(c->stun_host[count], text, host_length);
-        c->stun_host[count][host_length] = 0;
-        /* A bracketed v6 literal is written [addr] on the wire of the config. */
-        if (c->stun_host[count][0] == '[') {
-            size_t inner = strlen(c->stun_host[count]);
-            if (inner < 3 || c->stun_host[count][inner - 1] != ']')
-                return FASTP2P_EINVAL;
-            memmove(c->stun_host[count], c->stun_host[count] + 1, inner - 2);
-            c->stun_host[count][inner - 2] = 0;
-        }
-        c->stun_port[count] = (uint16_t)port;
         ++count;
     }
     c->stun_count = count;
     return FASTP2P_OK;
 }
+
 /* Same IP, ignoring the port: the STUN filtering test asks whether the peer
  * address changed at all, which is independent of the port it changed to. */
 static int same_ip(const op_addr *a, const op_addr *b) {
