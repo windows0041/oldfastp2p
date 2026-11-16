@@ -122,6 +122,11 @@ typedef struct {
     int mapped_seen;
     int mapped_same; /* every server reported the same mapping */
     int port_changed, ip_changed;
+    /* A server that answers a CHANGE-REQUEST from the same tuple simply ignores
+     * the attribute, so its silence proves nothing about our NAT. Only a reply
+     * from a different source shows the request reached a server that honours
+     * it - and only then does a *missing* reply mean the NAT filtered it. */
+    int port_supported, ip_supported;
     int level; /* 0 = STUN produced no verdict */
 } nat_stun;
 typedef struct {
@@ -4060,12 +4065,14 @@ static void nat_stun_finish(fastp2p_client *c) {
     else
         s->level = 3;
     {
-        char message[128];
+        char message[160];
         snprintf(message, sizeof(message),
-                 "STUN NAT level: %d (mapping %s, other port %s, other address %s)", s->level,
-                 s->mapped_same ? "stable" : "per-destination",
+                 "STUN NAT level: %d (mapping %s, other port %s, other address %s; "
+                 "change-request honoured: port %s, address %s)",
+                 s->level, s->mapped_same ? "stable" : "per-destination",
                  s->port_changed ? "answered" : "filtered",
-                 s->ip_changed ? "answered" : "filtered");
+                 s->ip_changed ? "answered" : "filtered",
+                 s->port_supported ? "yes" : "no", s->ip_supported ? "yes" : "no");
         emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, message);
     }
     if (c->ws && c->login_ok)
@@ -4130,10 +4137,14 @@ static void nat_stun_step(fastp2p_client *c, uint64_t now) {
                  * port are judged separately: a CHANGE-REQUEST answer may come
                  * from another address, another port, or both. */
                 if (op_addr_family(&from) == op_addr_family(&s->addr[s->server])) {
-                    if (op_addr_port(&from) != op_addr_port(&s->addr[s->server]))
+                    if (op_addr_port(&from) != op_addr_port(&s->addr[s->server])) {
                         s->port_changed = 1;
-                    if (!same_ip(&from, &s->addr[s->server]))
+                        s->port_supported = 1;
+                    }
+                    if (!same_ip(&from, &s->addr[s->server])) {
                         s->ip_changed = 1;
+                        s->ip_supported = 1;
+                    }
                 }
                 /* Advance to the next variant, and to the next server once this
                  * one has answered all three: the cross-server comparison is
