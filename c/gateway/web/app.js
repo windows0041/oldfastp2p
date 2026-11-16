@@ -14,9 +14,12 @@
    * the foreign-source case, so NAT1 and NAT2 cannot be told apart yet. */
   const udpLevel = node =>
     ({1: 'NAT1', 2: 'NAT2', 3: 'NAT3', 4: 'NAT4', 5: 'NAT1/2'}[Number(node.natLevel)] || '未知');
-  /* TCP keeps the mapping-only wording: the TCP probe measures mapping stability
-   * and never sends a filtering probe, so it cannot distinguish NAT2/NAT3. */
-  const tcpLevel = value => ({1: 'NAT1', 2: 'NAT4'}[Number(value)] || '未知');
+  /* TCP is shown as a mapping observation, never as a NAT level. The probe
+   * measures whether the mapping depends on the destination and does not test
+   * inbound filtering, so a stable mapping is not full cone: a measured node kept
+   * its source port unchanged yet dropped every unsolicited SYN, which reads as
+   * NAT3 on UDP. */
+  const tcpMapping = value => ({1: '映射稳定', 2: '映射随目标'}[Number(value)] || '未知');
   const natDetail = value =>
     ({1: '映射与目标无关', 2: '对称（端口随机）', 3: '对称（端口递增）', 4: '对称（端口递减）'}[Number(value)] || '探测未完成');
   const hasFamily = (node, bit) => (Number(node.families) || 1) & bit;
@@ -113,11 +116,11 @@
       /* Only IPv4 is shown: with IPv6 there is normally no NAT to classify, so a
        * second pair of levels would be noise rather than information. */
       nat.append(element('span', '', 'UDP：' + udpLevel(n)),
-        element('small', 'node-subtitle', 'TCP：' + tcpLevel(n.tcpNatType)));
+        element('small', 'node-subtitle', 'TCP：' + tcpMapping(n.tcpNatType)));
       nat.title = 'UDP ' + udpLevel(n) +
         '：NAT1 全锥／NAT2 地址受限／NAT3 端口受限／NAT4 对称。' +
         '（映射观测：' + natDetail(n.udpNatType) + '；探测端口 ' + (Number(n.publicIPPort) || 0) + '）' +
-        'TCP ' + tcpLevel(n.tcpNatType) + '：只测映射稳定性（' +
+        'TCP ' + tcpMapping(n.tcpNatType) + '：只测映射稳定性（' +
         (Number(n.tcpNatSamples) || 0) + ' 个样本，' + (Number(n.tcpNatDestinationIPs) || 0) +
         ' 个目标 IP），未做入站过滤探测。' +
         (Number(n.natLevel) === 5 ? ' NAT1/2 表示映射为锥形，但当时没有第二个节点可用于区分是否接受陌生来源。' : '');
@@ -453,7 +456,7 @@
     for (const n of state.nodes) {
       if (n.name === state.selected.name) continue;
       const option = element('option', null,
-        `${n.name}（UDP：${udpLevel(n)} / TCP：${tcpLevel(n.tcpNatType)}）`);
+        `${n.name}（UDP：${udpLevel(n)} / TCP：${tcpMapping(n.tcpNatType)}）`);
       option.value = n.name; relay.append(option);
     }
     relay.value = app?.relayNode || '';
