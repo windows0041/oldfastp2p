@@ -7,6 +7,35 @@
 static const char *names[][2]={{"PeerNode","peerNode"},{"BindIP","whitelist"},
  {"DstHost","dstHost"},{"DstPort","dstPort"},{"SrcPort","srcPort"},
  {"RelayNode","relayNode"},{"Username","Username"},{"Password","Password"}};
+/* Keys whose value is already reproduced from the normalised columns. Anything
+ * else a caller stored on the rule is carried through untouched, so a field the
+ * console or a future release adds is never silently dropped on the way to the
+ * client. `_config` is the original descriptor and is handled separately. */
+static const char *internal_keys[]={"appName","protocol","srcPort","punchPriority",
+    "peerNode","dstHost","dstPort","relayNode","whitelist","enabled","_config",
+    "hasPassword","keepPassword"};
+static int internal_key(const char *key) {
+    for(unsigned i=0;i<sizeof(internal_keys)/sizeof(internal_keys[0]);++i)
+        if(!strcmp(key,internal_keys[i]))return 1;
+    return 0;
+}
+/* Base for the rendered rule: the original descriptor when there is one, else
+ * the stored payload itself so console-created rules keep their extra fields. */
+static json_object *render_base(json_object *rule) {
+    json_object *entry=NULL;
+    if(rule) {
+        json_object *original=gw_get(rule,"_config");
+        if(original&&!json_object_deep_copy(original,&entry,NULL))return entry;
+    }
+    entry=json_object_new_object();
+    if(!entry)return NULL;
+    if(!rule)return entry;
+    json_object_object_foreach(rule,key,value) {
+        if(internal_key(key))continue;
+        json_object_object_add(entry,key,json_object_get(value));
+    }
+    return entry;
+}
 static void copy(json_object *to,const char *key,json_object *from,const char *source) {
     json_object *value=gw_get(from,source);if(value)json_object_object_add(to,key,json_object_get(value));
 }
@@ -99,8 +128,8 @@ int gw_store_config_rules(sqlite3 *db,const char *node) {
     for(size_t i=0;i<json_object_array_length(list);++i) {
         json_object *row=json_object_array_get_idx(list,i),*rule=gw_get(row,"rule"),*entry=NULL;
         int proxy=!strcmp(gw_string(row,"protocol"),"socks5");
-        json_object *original=gw_get(rule,"_config");
-        if(!original||json_object_deep_copy(original,&entry,NULL))entry=json_object_new_object();
+        entry=render_base(rule);
+        if(!entry) {json_object_put(list);json_object_put(fields);return -1;}
         copy(entry,proxy?"Name":"AppName",rule,"appName");
         for(unsigned k=0;k<sizeof(names)/sizeof(names[0]);++k)copy(entry,names[k][0],rule,names[k][1]);
         if(!proxy)gw_js(entry,"Protocol",gw_string(row,"protocol"));

@@ -24,12 +24,21 @@ static void parser(void) {
     stun_packet(p,tid);put16(p+20,0x0001);put16(p+26,12345);put32(p+28,0xc0000201);
     assert(fp_tcp_stun_response(p,sizeof(p),tid,&mapped)==1 && ntohs(mapped.sin_port)==12345);
     const char *echo="203.0.113.7:45678\n";
-    for(size_t n=0;n<strlen(echo);++n)assert(!fp_tcp_echo_response((const uint8_t *)echo,n,&mapped));
-    assert(fp_tcp_echo_response((const uint8_t *)echo,strlen(echo),&mapped)==1 && ntohs(mapped.sin_port)==45678);
+    op_addr echo_mapped;
+    for(size_t n=0;n<strlen(echo);++n)assert(!fp_tcp_echo_response((const uint8_t *)echo,n,&echo_mapped));
+    assert(fp_tcp_echo_response((const uint8_t *)echo,strlen(echo),&echo_mapped)==1 &&
+           op_addr_family(&echo_mapped)==AF_INET && op_addr_port(&echo_mapped)==45678);
     const char *invalid[]={"203.0.113.7:+1\n","203.0.113.7:65536\n","203.0.113.7:99999999999999999999\n",
         "203.0.113.7:1 extra\n","203.0.113.7:0\n","0.0.0.0:1234\n"};
     for(unsigned i=0;i<sizeof(invalid)/sizeof(invalid[0]);++i)
-        assert(fp_tcp_echo_response((const uint8_t *)invalid[i],strlen(invalid[i]),&mapped)==-1);
+        assert(fp_tcp_echo_response((const uint8_t *)invalid[i],strlen(invalid[i]),&echo_mapped)==-1);
+    /* SPEC §3 probeV3: the IPv6 form is bracketed and carries a v6 endpoint. */
+    const char *echo6="[2001:db8::1]:45678\n";
+    assert(fp_tcp_echo_response((const uint8_t *)echo6,strlen(echo6),&echo_mapped)==1 &&
+           op_addr_family(&echo_mapped)==AF_INET6 && op_addr_port(&echo_mapped)==45678);
+    const char *invalid6[]={"[]:1\n","[::1]1\n","[::]:1\n","[2001:db8::1]:0\n"};
+    for(unsigned i=0;i<sizeof(invalid6)/sizeof(invalid6[0]);++i)
+        assert(fp_tcp_echo_response((const uint8_t *)invalid6[i],strlen(invalid6[i]),&echo_mapped)==-1);
 }
 static void config(void) {
     fp_tcp_nat state;fp_tcp_nat_init(&state);
@@ -46,14 +55,20 @@ static void config(void) {
     fp_tcp_nat_close(&state);fp_tcp_nat_close(&state);
 }
 static void real_echo(int changed,int malformed) {
-    fp_tcp_nat state;fp_tcp_nat_init(&state);state.prepared=1;state.target_count=2;
+    /* Every observation lives in the per-family slot; this test drives the v4
+     * one, which has to keep the exact values the single-family state produced. */
+    fp_tcp_nat state;fp_tcp_nat_init(&state);
+    state.family[OP_FAM_V4].prepared=1;state.family[OP_FAM_V4].target_count=2;
     op_socket listeners[2],peers[2]={-1,-1};unsigned phase[2]={0};uint16_t ports[2]={0};
     for(unsigned i=0;i<2;++i){
         listeners[i]=op_socket_open(AF_INET,SOCK_STREAM,0);assert(listeners[i]>=0);
         struct sockaddr_in addr={.sin_family=AF_INET,.sin_addr={.s_addr=htonl(INADDR_LOOPBACK)}};
         assert(!op_bind(listeners[i],(struct sockaddr *)&addr,sizeof(addr)) && !op_listen(listeners[i],4));
         op_socklen length=sizeof(addr);assert(!op_getsockname(listeners[i],(struct sockaddr *)&addr,&length));
-        state.targets[i].address=addr;
+        memset(&state.family[OP_FAM_V4].targets[i].address,0,sizeof(op_addr));
+        memcpy(&state.family[OP_FAM_V4].targets[i].address.u.storage,&addr,sizeof(addr));
+        state.family[OP_FAM_V4].targets[i].address.len=(op_socklen)sizeof(addr);
+        state.family[OP_FAM_V4].targets[i].stun=0;
     }
     uint64_t deadline=op_monotonic_ns()+UINT64_C(5000000000);int done=0;
     while(op_monotonic_ns()<deadline && !done){
@@ -84,8 +99,10 @@ static void real_echo(int changed,int malformed) {
         op_sleep_ms(2);
     }
     assert(done && ports[0] && ports[0]==ports[1]);
-    assert(state.samples==(malformed?1u:2u) && state.destinations==1);
-    assert(state.type==(malformed?FP_NAT_UNKNOWN:changed?FP_NAT_DEPENDENT:FP_NAT_STABLE));
+    assert(done & 1u); /* bit0 is IPv4 (DUALSTACK-SPEC §1) */
+    const fp_tcp_family *v4=&state.family[OP_FAM_V4];
+    assert(v4->samples==(malformed?1u:2u) && v4->destinations==1);
+    assert(v4->type==(malformed?FP_NAT_UNKNOWN:changed?FP_NAT_DEPENDENT:FP_NAT_STABLE));
     assert(!fp_tcp_nat_step(&state,op_monotonic_ns()));
     fp_tcp_nat_close(&state);
     for(unsigned i=0;i<2;++i){if(peers[i]>=0)op_close(peers[i]);op_close(listeners[i]);}

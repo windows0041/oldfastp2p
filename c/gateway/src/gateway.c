@@ -46,6 +46,7 @@ static void http_error(struct connection *c, int status, unsigned code, const ch
 static void upload_abort(struct connection *c);
 static int query(struct lws *wsi, const char *name, char *out, size_t capacity);
 static unsigned query_integer(struct lws *wsi, const char *name, unsigned limit, unsigned fallback);
+static int on_api_vhost(struct lws *wsi);
 
 static struct connection *find_node(uint64_t id) {
     for (unsigned i = 0; i < g.max_nodes; ++i)
@@ -147,18 +148,102 @@ static void copy_field(char *out, size_t size, json_object *j, const char *name)
     snprintf(out, size, "%s", gw_string(j, name));
 }
 static int nat_fields(struct connection *c, json_object *j) {
-    const char *keys[] = {"udpNatType", "tcpNatType", "tcpNatSamples", "tcpNatDestinationIPs"};
-    unsigned *values[] = {&c->nat, &c->tcp_nat, &c->tcp_nat_samples, &c->tcp_nat_ips};
-    for (unsigned i = 0; i < 4; ++i) {
+    /* DUALSTACK-SPEC §4: the per-family levels are parallel fields on the very
+     * same frames, so one loop validates both families. A missing field leaves
+     * the stored value untouched, which keeps old clients byte-compatible. */
+    const char *keys[] = {"udpNatType", "tcpNatType", "tcpNatSamples", "tcpNatDestinationIPs",
+                          "udpNatType6", "tcpNatType6", "tcpNatSamples6",
+                          "tcpNatDestinationIPs6"};
+    unsigned *values[] = {&c->nat, &c->tcp_nat, &c->tcp_nat_samples, &c->tcp_nat_ips,
+                          &c->nat6, &c->tcp_nat6, &c->tcp_nat6_samples, &c->tcp_nat6_ips};
+    for (unsigned i = 0; i < 8; ++i) {
         json_object *v = gw_get(j, keys[i]);
         if (!v) continue;
         if (!json_object_is_type(v, json_type_int) || json_object_get_int64(v) < 0) return -1;
         uint64_t n = json_object_get_uint64(v);
-        if ((i == 0 && n != 1 && n != 2 && n != 3 && n != 4 && n != 314) ||
-            (i == 1 && n != 1 && n != 2 && n != 314) || (i >= 2 && n > 6)) return -1;
+        int udp_family_slot = i == 0 || i == 4;
+        int tcp_family_slot = i == 1 || i == 5;
+        int count_slot = i == 2 || i == 3 || i >= 6; /* samples / destination IPs cap at 6 */
+        if ((udp_family_slot && n != 1 && n != 2 && n != 3 && n != 4 && n != 314) ||
+            (tcp_family_slot && n != 1 && n != 2 && n != 314) || (count_slot && n > 6)) return -1;
         *values[i] = (unsigned)n;
     }
-    return c->tcp_nat_ips > c->tcp_nat_samples ? -1 : 0;
+    if (c->tcp_nat_ips > c->tcp_nat_samples) return -1;
+    if (c->tcp_nat6_ips > c->tcp_nat6_samples) return -1;
+    /* natLevel is the inbound-filtering refinement: 1..4 are the four classic
+     * levels, 5 means "cone, filtering not measurable here" and 0 unknown. It is
+     * separate from udpNatType on purpose - the latter stays a pure mapping
+     * observation so peers and the relay filter keep reading it as before. */
+    json_object *level = gw_get(j, "natLevel");
+    if (level) {
+        if (!json_object_is_type(level, json_type_int) || json_object_get_int64(level) < 0)
+            return -1;
+        uint64_t n = json_object_get_uint64(level);
+        if (n > 5)
+            return -1;
+        c->nat_level = (unsigned)n;
+    }
+    return 0;
+}
+/* The family a relay decision is made for: IPv6 wins whenever both ends can use
+ * it (SPEC §5 prefers v6 because stateless NAT is far more common there). */
+static unsigned selected_family(unsigned common) {
+    if (common & GW_FAMILY_V6)
+        return GW_FAMILY_V6;
+    return GW_FAMILY_V4;
+}
+static const char *family_ip(const struct connection *n, unsigned family) {
+    return family == GW_FAMILY_V6 ? n->ipv6 : n->ip;
+}
+static unsigned family_nat(const struct connection *n, unsigned family, int tcp) {
+    if (family == GW_FAMILY_V6)
+        return tcp ? n->tcp_nat6 : n->nat6;
+    return tcp ? n->tcp_nat : n->nat;
+}
+static unsigned observe_peer(struct lws *wsi, struct connection *c) {
+    struct sockaddr_storage peer;
+    socklen_t length = sizeof(peer);
+    /* SPEC §1: the WSS source family is hard evidence, so it is what fills the
+     * address columns and the corresponding families bit. A v4-mapped v6 socket
+     * is normalized back to IPv4: an IPv4 client must never be rejected or
+     * re-labelled because the listener happened to be dual-family. */
+    if (getpeername(lws_get_socket_fd(wsi), (struct sockaddr *)&peer, &length))
+        return 0;
+    if (peer.ss_family == AF_INET) {
+        struct sockaddr_in *v4 = (struct sockaddr_in *)&peer;
+        return inet_ntop(AF_INET, &v4->sin_addr, c->ip, sizeof(c->ip)) ? GW_FAMILY_V4 : 0;
+    }
+    if (peer.ss_family == AF_INET6) {
+        struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&peer;
+        if (IN6_IS_ADDR_V4MAPPED(&v6->sin6_addr)) {
+            struct in_addr mapped;
+            memcpy(&mapped, ((const unsigned char *)&v6->sin6_addr) + 12, sizeof(mapped));
+            return inet_ntop(AF_INET, &mapped, c->ip, sizeof(c->ip)) ? GW_FAMILY_V4 : 0;
+        }
+        return inet_ntop(AF_INET6, &v6->sin6_addr, c->ipv6, sizeof(c->ipv6)) ? GW_FAMILY_V6 : 0;
+    }
+    return 0;
+}
+/* SPEC §4: the per-family v6 observation fields ride on 6/0 and on the 6/9
+ * update channel. A value that is not a canonical IPv6 literal is ignored, like
+ * any other unparseable self-reported field: it must never clear the address
+ * observed on the socket, and it must never kill a legacy connection that sends
+ * free-form text here. */
+static void report_ipv6(struct connection *c, json_object *j) {
+    if (gw_get(j, "IPv6")) {
+        const char *text = gw_string(j, "IPv6");
+        struct in6_addr scratch;
+        if (*text && strlen(text) < sizeof(c->ipv6) &&
+            inet_pton(AF_INET6, text, &scratch) == 1) {
+            snprintf(c->ipv6, sizeof(c->ipv6), "%s", text);
+            c->families |= GW_FAMILY_V6;
+        }
+    }
+    if (gw_get(j, "hasIPv6")) {
+        c->has_ipv6 = (unsigned)(gw_integer(j, "hasIPv6") != 0);
+        if (c->has_ipv6)
+            c->families |= GW_FAMILY_V6;
+    }
 }
 static int dispatch(struct connection *c, uint16_t main, uint16_t sub, const unsigned char *data,
                     size_t len) {
@@ -219,7 +304,9 @@ static int dispatch(struct connection *c, uint16_t main, uint16_t sub, const uns
             return -1;
         }
     } else if (main == 6 && sub == 9) {
-        if (nat_fields(c, j) || gw_store_save(g.db, c, 1)) {
+        if (nat_fields(c, j)) { json_object_put(j); return -1; }
+        report_ipv6(c, j);
+        if (gw_store_save(g.db, c, 1)) {
             json_object_put(j); return -1;
         }
     } else if (main == 6 && sub == 0) {
@@ -227,11 +314,40 @@ static int dispatch(struct connection *c, uint16_t main, uint16_t sub, const uns
         copy_field(c->os, sizeof(c->os), j, "os");
         copy_field(c->mac, sizeof(c->mac), j, "mac");
         copy_field(c->lan, sizeof(c->lan), j, "lanIP");
-        copy_field(c->ipv6, sizeof(c->ipv6), j, "IPv6");
+        /* "IPv6" is validated and applied below: an absent field must not clear
+         * the address the gateway observed on the socket itself. */
         copy_field(c->version, sizeof(c->version), j, "version");
         copy_field(c->hostname, sizeof(c->hostname), j, "hostname");
         c->has_ipv4 = (unsigned)(gw_integer(j, "hasIPv4") != 0);
         c->has_upnp = (unsigned)(gw_integer(j, "hasUPNPorNATPMP") != 0);
+        /* SPEC §4: the v6 public observation and reachability flag ride on the
+         * registration frame too; absent or invalid fields keep the observed
+         * values (a legacy free-form "IPv6" string must not break login). */
+        report_ipv6(c, j);
+        /* SPEC §1: families defaults to IPv4-only when absent; the observed
+         * socket family always keeps its bit (establish() set it already). */
+        {
+            json_object *families = gw_get(j, "families");
+            if (families) {
+                uint64_t wanted = gw_integer(j, "families");
+                if (!json_object_is_type(families, json_type_int) ||
+                    json_object_get_int64(families) < 0 || !wanted || wanted > GW_FAMILY_BOTH) {
+                    json_object_put(j);
+                    return -1;
+                }
+                c->families |= (unsigned)wanted;
+            }
+            /* Only an explicit negative clears a bit; an absent field keeps the
+             * observation. Legacy frames carry hasIPv4 but no IPv6 fields, so a
+             * v6-only registration must not drop the socket's own family. */
+            if (gw_get(j, "hasIPv4") && !c->has_ipv4 && c->observed_family != GW_FAMILY_V4)
+                c->families &= ~GW_FAMILY_V4;
+            if (gw_get(j, "hasIPv6") && !c->has_ipv6 && c->observed_family != GW_FAMILY_V6)
+                c->families &= ~GW_FAMILY_V6;
+            /* The socket remains the strongest evidence of what this node can
+             * actually do right now. */
+            c->families |= c->observed_family;
+        }
         uint64_t port = gw_integer(j, "publicIPPort");
         if (port > 65535) {
             json_object_put(j);
@@ -306,6 +422,15 @@ static int dispatch(struct connection *c, uint16_t main, uint16_t sub, const uns
             gw_ju(response, "hasIPv4", target->has_ipv4);
             gw_ju(response, "hasUPNPorNATPMP", target->has_upnp);
             gw_js(response, "IPv6", target->ipv6);
+            /* SPEC §1/§4: per-family levels and the family bitmap, so a peer can
+             * pick v6 hole-punching without guessing. */
+            gw_ju(response, "families", target->families);
+            gw_ju(response, "hasIPv6", target->has_ipv6);
+            gw_ju(response, "natLevel", target->nat_level);
+            gw_ju(response, "udpNatType6", target->nat6);
+            gw_ju(response, "tcpNatType6", target->tcp_nat6);
+            gw_ju(response, "tcpNatSamples6", target->tcp_nat6_samples);
+            gw_ju(response, "tcpNatDestinationIPs6", target->tcp_nat6_ips);
         } else
             gw_ju(response, "online", 0);
         send_json(c, 7, 1, response);
@@ -319,15 +444,26 @@ static int dispatch(struct connection *c, uint16_t main, uint16_t sub, const uns
         int tcp_relay = !strcmp(gw_string(j, "underlayProtocol"), "tcp");
         json_object *exclude = gw_get(j, "exclude");
         struct connection *relay = NULL;
+        /* SPEC §6: a relay may only serve a pair if it can reach the selected
+         * family of both endpoints. Unknown peers (offline) fall back to the
+         * requester's own families so the choice stays conservative. */
+        unsigned common = peer ? (c->families & peer->families) : c->families;
+        if (!common)
+            common = c->families ? c->families : GW_FAMILY_V4;
+        unsigned family = selected_family(common);
         /* Rank candidates by how likely they are to be reachable: a node on a
          * different public address than the peer does not need hairpin NAT, an
          * endpoint-independent mapping (nat 1) beats an unknown one, a larger
          * shared bandwidth beats a smaller one, and the least recently used
-         * relay breaks ties so no single node carries every session. */
-#define RELAY_RANK(n) \
-    (((n)->ip[0] && peer && peer->ip[0] && !strcmp((n)->ip, peer->ip)) ? 0u : 1u)
+         * relay breaks ties so no single node carries every session.
+         * The comparison is made on the selected family's address. */
+#define RELAY_RANK(n)                                                                        \
+    ((family_ip(n, family)[0] && peer && family_ip(peer, family)[0] &&                       \
+      !strcmp(family_ip(n, family), family_ip(peer, family)))                                \
+         ? 0u                                                                                \
+         : 1u)
         unsigned seen = 0, skip_self = 0, skip_peer = 0, skip_nat = 0, skip_major = 0,
-                 skip_exclude = 0;
+                 skip_exclude = 0, skip_family = 0;
         for (unsigned i = 0; i < g.max_nodes; ++i) {
             struct connection *n = g.nodes[i];
             if (!n || n->closing)
@@ -341,10 +477,18 @@ static int dispatch(struct connection *c, uint16_t main, uint16_t sub, const uns
                 ++skip_peer;
                 continue;
             }
+            /* Hard family filter: the candidate must cover every family the two
+             * endpoints share — a v4-only relay is never chosen for a v6
+             * endpoint pair, and vice versa (SPEC §6). */
+            if ((n->families & common) != common) {
+                ++skip_family;
+                continue;
+            }
             /* nat 1 is endpoint-independent; 2, 3 and 4 are symmetric in
              * different flavours and cannot accept an unsolicited peer.
-             * Unknown (314) stays eligible: it usually means probing failed. */
-            unsigned candidate_nat = tcp_relay ? n->tcp_nat : n->nat;
+             * Unknown (314) stays eligible: it usually means probing failed.
+             * The level checked is the one for the selected family. */
+            unsigned candidate_nat = family_nat(n, family, tcp_relay);
             if (candidate_nat == 2 || candidate_nat == 3 || candidate_nat == 4) {
                 ++skip_nat;
                 continue;
@@ -371,8 +515,8 @@ static int dispatch(struct connection *c, uint16_t main, uint16_t sub, const uns
                 relay = n;
             else {
                 unsigned rank = RELAY_RANK(n), best = RELAY_RANK(relay);
-                unsigned quality = (tcp_relay ? n->tcp_nat : n->nat) == 1 ? 1u : 0u;
-                unsigned best_quality = (tcp_relay ? relay->tcp_nat : relay->nat) == 1 ? 1u : 0u;
+                unsigned quality = family_nat(n, family, tcp_relay) == 1 ? 1u : 0u;
+                unsigned best_quality = family_nat(relay, family, tcp_relay) == 1 ? 1u : 0u;
                 if (rank != best)
                     relay = rank > best ? n : relay;
                 else if (quality != best_quality)
@@ -389,11 +533,13 @@ static int dispatch(struct connection *c, uint16_t main, uint16_t sub, const uns
         uint64_t now_ms = gw_mono_ms();
         if (now_ms - c->relay_log_ms >= 5000) {
             printf("{\"event\":\"relay-select\",\"from\":\"%s\",\"peer\":\"%s\","
-                   "\"connected\":%u,\"skipped\":{\"self\":%u,\"peer\":%u,\"symmetric\":%u,"
-                   "\"major\":%u,\"excluded\":%u},\"relay\":\"%s\",\"relayNat\":%u,"
+                   "\"family\":%u,\"connected\":%u,\"skipped\":{\"self\":%u,\"peer\":%u,"
+                   "\"symmetric\":%u,\"major\":%u,\"excluded\":%u,\"family\":%u},"
+                   "\"relay\":\"%s\",\"relayNat\":%u,"
                    "\"relayBandwidth\":%u}\n",
-                   c->node, peer ? peer->node : "", seen, skip_self, skip_peer, skip_nat, skip_major,
-                   skip_exclude, relay ? relay->node : "", relay ? relay->nat : 0,
+                   c->node, peer ? peer->node : "", family, seen, skip_self, skip_peer, skip_nat,
+                   skip_major, skip_exclude, skip_family, relay ? relay->node : "",
+                   relay ? family_nat(relay, family, tcp_relay) : 0,
                    relay ? relay->bandwidth : 0);
             fflush(stdout);
             c->relay_log_ms = now_ms;
@@ -401,6 +547,8 @@ static int dispatch(struct connection *c, uint16_t main, uint16_t sub, const uns
         json_object *response = json_object_new_object();
         gw_js(response, "relay", relay ? relay->node : "");
         gw_ju(response, "error", relay ? 0 : 1);
+        /* SPEC §6: tell the client which family the choice was made for. */
+        gw_ju(response, "family", family);
         if (relay)
             relay->relay_time = gw_mono_ms();
         send_json(c, 5, 1, response);
@@ -564,6 +712,14 @@ static json_object *devices(void) {
         gw_ju(j, "tcpNatType", n->tcp_nat);
         gw_ju(j, "tcpNatSamples", n->tcp_nat_samples);
         gw_ju(j, "tcpNatDestinationIPs", n->tcp_nat_ips);
+        /* SPEC §4: per-family levels for the console. */
+        gw_ju(j, "udpNatType6", n->nat6);
+        gw_ju(j, "tcpNatType6", n->tcp_nat6);
+        gw_ju(j, "tcpNatSamples6", n->tcp_nat6_samples);
+        gw_ju(j, "tcpNatDestinationIPs6", n->tcp_nat6_ips);
+        gw_ju(j, "natLevel", n->nat_level);
+        gw_ju(j, "families", n->families);
+        gw_ju(j, "hasIPv6", n->has_ipv6);
         snprintf(number, sizeof(number), "%u", n->bandwidth);
         gw_js(j, "bandwidth", number);
         gw_js(j, "lanip", n->lan);
@@ -583,16 +739,25 @@ static json_object *devices(void) {
     }
     return root;
 }
-/* Per-source-IP budget for the login endpoint. Returns non-zero when the request
+/* Per-source-address budget for the login endpoint. Returns non-zero when the request
  * must be rejected before the expensive password hash runs. The table is small
- * and bounded: a busy public gateway cannot be made to allocate without limit. */
-static struct login_attempt *login_slot(uint32_t address) {
+ * and bounded: a busy public gateway cannot be made to allocate without limit.
+ * The key covers both families: an IPv6 source must not bypass the limiter. */
+static struct login_attempt *login_slot(unsigned family, const unsigned char *address) {
     /* Mix the address so sequential sources do not all land in one slot. */
-    uint32_t hash = address ^ (address >> 16) ^ (address >> 8);
+    uint32_t hash = family;
+    for (unsigned i = 0; i < 16; i += 4) {
+        uint32_t word;
+        memcpy(&word, address + i, sizeof(word));
+        hash = hash * 31u + word;
+    }
+    hash ^= hash >> 16;
     unsigned index = hash % GW_LOGIN_SLOTS;
     for (unsigned i = 0; i < GW_LOGIN_SLOTS; ++i) {
         struct login_attempt *entry = &g.logins[(index + i) % GW_LOGIN_SLOTS];
-        if (entry->address == address || !entry->address)
+        if (entry->family == family && !memcmp(entry->address, address, 16))
+            return entry;
+        if (!entry->family)
             return entry;
     }
     /* All slots are taken: evict the oldest window. */
@@ -602,18 +767,46 @@ static struct login_attempt *login_slot(uint32_t address) {
             oldest = &g.logins[i];
     return oldest;
 }
-static int login_limited(struct connection *c, uint32_t *out_address) {
-    struct sockaddr_in peer;
+static void login_key(unsigned family, const struct sockaddr_storage *peer, unsigned char *out) {
+    memset(out, 0, 16);
+    if (family == AF_INET)
+        memcpy(out, &((const struct sockaddr_in *)peer)->sin_addr, 4);
+    else
+        memcpy(out, &((const struct sockaddr_in6 *)peer)->sin6_addr, 16);
+}
+/* 0 = continue, 1 = limited. *family is 0 when no usable source address exists,
+ * in which case credentials alone gate the request, exactly as before. */
+static int login_limited(struct connection *c, unsigned *family, unsigned char *address) {
+    struct sockaddr_storage peer;
     socklen_t length = sizeof(peer);
-    if (getpeername(lws_get_socket_fd(c->wsi), (struct sockaddr *)&peer, &length) ||
-        peer.sin_family != AF_INET)
+    *family = 0;
+    if (getpeername(lws_get_socket_fd(c->wsi), (struct sockaddr *)&peer, &length))
+        return 0;
+    if (peer.ss_family == AF_INET6) {
+        /* Normalize a v4-mapped peer to its IPv4 key so one NAT behind a
+         * dual-stack listener cannot get two independent budgets. */
+        if (IN6_IS_ADDR_V4MAPPED(&((struct sockaddr_in6 *)&peer)->sin6_addr)) {
+            struct sockaddr_in mapped;
+            memset(&mapped, 0, sizeof(mapped));
+            mapped.sin_family = AF_INET;
+            memcpy(&mapped.sin_addr,
+                   ((const unsigned char *)&((struct sockaddr_in6 *)&peer)->sin6_addr) + 12,
+                   sizeof(mapped.sin_addr));
+            memset(&peer, 0, sizeof(peer));
+            memcpy(&peer, &mapped, sizeof(mapped));
+            length = sizeof(mapped);
+        }
+    }
+    if (peer.ss_family != AF_INET && peer.ss_family != AF_INET6)
         return 0; /* no usable address: fall through to credentials as before */
-    *out_address = peer.sin_addr.s_addr;
+    *family = (unsigned)peer.ss_family;
+    login_key(*family, &peer, address);
     uint64_t now = gw_mono_ms();
-    struct login_attempt *entry = login_slot(peer.sin_addr.s_addr);
-    if (entry->address != peer.sin_addr.s_addr) {
+    struct login_attempt *entry = login_slot(*family, address);
+    if (entry->family != *family || memcmp(entry->address, address, 16)) {
         memset(entry, 0, sizeof(*entry));
-        entry->address = peer.sin_addr.s_addr;
+        entry->family = *family;
+        memcpy(entry->address, address, 16);
     }
     if (entry->locked_until && now < entry->locked_until)
         return 1;
@@ -630,11 +823,11 @@ static int login_limited(struct connection *c, uint32_t *out_address) {
     ++entry->attempts;
     return 0;
 }
-static void login_result(uint32_t address, int success) {
-    if (!address)
+static void login_result(unsigned family, const unsigned char *address, int success) {
+    if (!family)
         return;
-    struct login_attempt *entry = login_slot(address);
-    if (entry->address != address)
+    struct login_attempt *entry = login_slot(family, address);
+    if (entry->family != family || memcmp(entry->address, address, 16))
         return;
     if (success) {
         memset(entry, 0, sizeof(*entry));
@@ -822,11 +1015,16 @@ static int push_update(struct connection *node, const char *version) {
     gw_js(j, "sha256", sha);
     gw_ju(j, "size", size);
     gw_js(j, "platform", platform);
-    char url[640];
-    unsigned port = lws_get_vhost(node->wsi) == g.ws_alt_vhost ? g.alt_ws_port : g.ws_port;
+    char url[700], authority[300];
+    struct lws_vhost *vhost = lws_get_vhost(node->wsi);
+    unsigned port = vhost == g.ws_alt_vhost                ? g.alt_ws_port
+                    : vhost == g.ws_alt_vhost6            ? g.alt_ws6_port
+                                                          : g.ws_port;
+    /* An IPv6 literal host needs brackets or the URL authority is ambiguous. */
+    gw_host_url_authority(authority, sizeof(authority), g.public_host);
     snprintf(url, sizeof(url),
              "https://%s:%u/api/v1/update/download?platform=%s&version=%s&token=%" PRIu64,
-             g.public_host, port, platform, version, g.token);
+             authority, port, platform, version, g.token);
     gw_js(j, "url", url);
     int rv = send_json(node, 3, 18, j);
     json_object_put(j);
@@ -899,7 +1097,7 @@ static void handle_http(struct connection *c) {
         return;
     int download = !c->post && !c->put && !c->deleting &&
                    !strcmp(c->uri, "/api/v1/update/download");
-    if (!download && lws_get_vhost(c->wsi) != g.api_vhost) {
+    if (!download && !on_api_vhost(c->wsi)) {
         http_error(c, 404, 1, "not found");
         return;
     }
@@ -1179,8 +1377,9 @@ static void handle_http(struct connection *c) {
     if (c->post && !strcmp(c->uri, "/api/v1/user/login")) {
         /* Reject before the expensive PBKDF2 verification when this source has
          * used up its budget or is serving a lockout. */
-        uint32_t address = 0;
-        if (login_limited(c, &address)) {
+        unsigned family = 0;
+        unsigned char address[16] = {0};
+        if (login_limited(c, &family, address)) {
             http_error(c, 429, 9, "too many login attempts");
             return;
         }
@@ -1188,7 +1387,7 @@ static void handle_http(struct connection *c) {
         if (!j || !json_object_is_type(j, json_type_object)) {
             if (j)
                 json_object_put(j);
-            login_result(address, 0);
+            login_result(family, address, 0);
             http_error(c, 400, 1, "invalid JSON");
             return;
         }
@@ -1196,7 +1395,7 @@ static void handle_http(struct connection *c) {
                     gw_admin_verify(&g.admin, gw_string(j, "password"));
         if (j)
             json_object_put(j);
-        login_result(address, valid);
+        login_result(family, address, valid);
         if (!valid) {
             http_error(c, 401, 1, "invalid credentials");
             return;
@@ -1361,21 +1560,13 @@ static void handle_http(struct connection *c) {
      * queued by being stored and applied on the client's next connection. */
     struct connection *target = find_node(gw_node_id(name));
 
-    if(!strcmp(end,"/config")) {
-        if(c->post) {
-            if(target&&!target->config_supported) {http_error(c,501,1,"client does not support configuration updates");return;}
-            json_object *body=gw_json(c->request,c->request_length);
-            json_object *fields=body?gw_get(body,"fields"):NULL;
-            if(!json_object_is_type(fields,json_type_object)||gw_store_config_put(g.db,name,fields)) {
-                if(body)json_object_put(body);
-                http_error(c,400,1,"invalid configuration fields");return;
-            }
-            json_object_put(body);
-            if(push_config(target)) {http_error(c,503,1,"configuration queued; node busy");return;}
-        } else if(c->put||c->deleting) {http_error(c,405,1,"method not allowed");return;}
-        json_object *config=gw_store_config(g.db,name);
-        if(!config) {http_error(c,503,1,"configuration storage unavailable");return;}
-        http_json(c,200,config);json_object_put(config);return;
+    /* Manual field configuration was removed: the operator can no longer submit
+     * arbitrary JSON to a node. The gateway still owns forwarding and SOCKS5
+     * rules, and those are delivered over the same versioned config channel
+     * (main 3 sub 19) from gw_store_config_rules() plus push_config() below. */
+    if (!strcmp(end, "/config")) {
+        http_error(c, 410, 1, "manual configuration push was removed; use forwarding rules");
+        return;
     }
 
     if (!c->post && !strcmp(end, "/apps")) {
@@ -1667,10 +1858,14 @@ static unsigned query_integer(struct lws *wsi, const char *name, unsigned limit,
                ? fallback
                : (unsigned)n;
 }
+static int on_api_vhost(struct lws *wsi) {
+    return lws_get_vhost(wsi) == g.api_vhost || lws_get_vhost(wsi) == g.api_vhost6;
+}
 static int login_status(struct lws *wsi) {
     char uri[256], node[32], token[32];
     uint64_t value;
-    if (lws_get_vhost(wsi) != g.ws_vhost && lws_get_vhost(wsi) != g.ws_alt_vhost)
+    if (lws_get_vhost(wsi) != g.ws_vhost && lws_get_vhost(wsi) != g.ws_alt_vhost &&
+        lws_get_vhost(wsi) != g.ws_vhost6 && lws_get_vhost(wsi) != g.ws_alt_vhost6)
         return 404;
     if (lws_hdr_copy(wsi, uri, sizeof(uri), WSI_TOKEN_GET_URI) < 0 ||
         (strcmp(uri, "/api/v1/login") && strcmp(uri, "/fastp2p/v1/login")))
@@ -1726,6 +1921,13 @@ static int establish(struct lws *wsi, struct connection *c) {
     memset(c, 0, sizeof(*c));
     c->wsi = wsi;
     c->slot = -1;
+    /* A connection is at least as capable as the family its socket arrived on
+     * (SPEC §1). The old code refused any non-AF_INET peer outright; with
+     * per-family vhosts the source is normalized per family instead. */
+    c->observed_family = observe_peer(wsi, c);
+    if (!c->observed_family)
+        return -1;
+    c->families = c->observed_family;
     if (query(wsi, "node=", c->node, sizeof(c->node)))
         return -1;
     char requested[32], device[33];
@@ -1748,17 +1950,37 @@ static int establish(struct lws *wsi, struct connection *c) {
         ++slot;
     if (slot == g.max_nodes)
         return -1;
-    struct sockaddr_in peer;
-    socklen_t plen = sizeof(peer);
-    if (getpeername(lws_get_socket_fd(wsi), (struct sockaddr *)&peer, &plen) ||
-        peer.sin_family != AF_INET || !inet_ntop(AF_INET, &peer.sin_addr, c->ip, sizeof(c->ip)))
-        return -1;
     query(wsi, "version=", c->version, sizeof(c->version));
-    query(wsi, "ipv6=", c->ipv6, sizeof(c->ipv6));
+    /* An explicitly reported ipv6= only completes what the socket proved. The
+     * literal is validated so garbage never claims the IPv6 family; an invalid
+     * value is ignored, never fatal, because legacy clients sent free-form text
+     * here and a login must stay byte-compatible for them. */
+    {
+        char reported[128];
+        if (!query(wsi, "ipv6=", reported, sizeof(reported))) {
+            struct in6_addr scratch;
+            if (inet_pton(AF_INET6, reported, &scratch) == 1) {
+                snprintf(c->ipv6, sizeof(c->ipv6), "%s", reported);
+                c->has_ipv6 = 1;
+                c->families |= GW_FAMILY_V6;
+            }
+        }
+    }
+    {
+        char families[32];
+        uint64_t wanted = 0;
+        if (!query(wsi, "families=", families, sizeof(families)) &&
+            !gw_decimal(families, &wanted) && wanted >= 1 && wanted <= GW_FAMILY_BOTH)
+            c->families |= (unsigned)wanted;
+    }
     c->major = major_version(c->version);
     c->nat = query_integer(wsi, "nattype=", 314, 314);
     c->tcp_nat = query_integer(wsi, "tcpnattype=", 314, 314);
     if (c->tcp_nat != 1 && c->tcp_nat != 2) c->tcp_nat = 314;
+    /* The IPv6 half starts "unknown" until a client actually probes it; a zero
+     * would not be a legal NAT level. */
+    c->nat6 = c->tcp_nat6 = 314;
+    c->tcp_nat6_samples = c->tcp_nat6_ips = 0;
     c->bandwidth = query_integer(wsi, "sharebandwidth=", 1000000, 0);
     c->slot = (int)slot;
     c->registered = 1;
@@ -1773,6 +1995,9 @@ static int establish(struct lws *wsi, struct connection *c) {
     }
     json_object *login = json_object_new_object();
     gw_ju(login, "tcpProbeV2", 1);
+    /* SPEC §3: the bracketed "[<v6>]:<port>" TCP echo is only enabled under V3,
+     * which a new client uses for v6 TCP probing. */
+    gw_ju(login, "tcpProbeV3", 1);
     gw_js(login, "user", g.user);
     gw_js(login, "node", c->node);
     gw_js(login, "protocol", "fastp2p2");
@@ -1842,7 +2067,7 @@ static int callback(struct lws *wsi, enum lws_callback_reasons reason, void *use
         char *method_uri = NULL;
         int method_length = 0;
         int method = lws_http_get_uri_and_method(wsi, &method_uri, &method_length);
-        if (lws_get_vhost(wsi) != g.api_vhost &&
+        if (!on_api_vhost(wsi) &&
             (method != LWSHUMETH_GET || strcmp(c->uri, "/api/v1/update/download"))) {
             http_error(c, 404, 1, "not found");
             return 0;
@@ -2026,11 +2251,20 @@ static void tick(lws_sorted_usec_list_t *sul) {
 }
 static void usage(void) {
     puts("fastp2p-gateway --cert FILE --key FILE [--bind IP] [--apibind IP]\n"
+         "  [--bind6 IPV6] [--apibind6 IPV6] [--altwss6 PORT]\n"
          "  [--port 27183] [--altwss 443] [--apiport 10008] [--database FILE]\n"
          "  [--max-clients 256] [--heartbeat-timeout 40] [--run-seconds N]\n"
          "  [--reset-admin] (stop the gateway before resetting its account)\n"
          "Set FASTP2P_USER, FASTP2P_PASSWORD and a 16-digit FASTP2P_TOKEN.\n"
-         "Default bind: 127.0.0.1. NAT ports: TCP 27180-27181, UDP 27180-27183.");
+         "Default bind: 127.0.0.1. NAT ports: TCP 27180-27181, UDP 27180-27183\n"
+         "per address family. --bind6/--apibind6 add independent IPv6 listeners\n"
+         "with identical behaviour; without them the gateway is IPv4-only.");
+}
+/* Accepts an IPv4 or IPv6 literal (SPEC §1/§7). */
+static int bind_text_valid(const char *text) {
+    struct in_addr v4;
+    struct in6_addr v6;
+    return inet_pton(AF_INET, text, &v4) == 1 || inet_pton(AF_INET6, text, &v6) == 1;
 }
 static int options(int argc, char **argv) {
     g.max_nodes = GW_MAX_NODES;
@@ -2053,9 +2287,12 @@ static int options(int argc, char **argv) {
                                          {"key", required_argument, 0, 'k'},
                                          {"bind", required_argument, 0, 'b'},
                                          {"apibind", required_argument, 0, 'a'},
+                                         {"bind6", required_argument, 0, 'B'},
+                                         {"apibind6", required_argument, 0, 'A'},
                                          {"port", required_argument, 0, 'p'},
                                          {"apiport", required_argument, 0, 'q'},
                                          {"altwss", required_argument, 0, 'x'},
+                                         {"altwss6", required_argument, 0, 'X'},
                                          {"max-clients", required_argument, 0, 'm'},
                                          {"heartbeat-timeout", required_argument, 0, 't'},
                                          {"run-seconds", required_argument, 0, 'r'},
@@ -2086,6 +2323,16 @@ static int options(int argc, char **argv) {
                 return -1;
             strcpy(g.api_bind, optarg);
             break;
+        case 'B':
+            if (strlen(optarg) >= sizeof(g.bind6))
+                return -1;
+            strcpy(g.bind6, optarg);
+            break;
+        case 'A':
+            if (strlen(optarg) >= sizeof(g.api_bind6))
+                return -1;
+            strcpy(g.api_bind6, optarg);
+            break;
         case 'd':
             g.database = optarg;
             break;
@@ -2101,20 +2348,23 @@ static int options(int argc, char **argv) {
         case 'p':
         case 'q':
         case 'x':
+        case 'X':
         case 'm':
         case 't':
         case 'r':
             if (gw_decimal(optarg, &value) || value > 86400 || !value)
                 return -1;
-            if (option == 'p' || option == 'q' || option == 'x') {
+            if (option == 'p' || option == 'q' || option == 'x' || option == 'X') {
                 if (value > 65535)
                     return -1;
                 if (option == 'p')
                     g.ws_port = (unsigned)value;
                 else if (option == 'q')
                     g.api_port = (unsigned)value;
-                else
+                else if (option == 'x')
                     g.alt_ws_port = (unsigned)value;
+                else
+                    g.alt_ws6_port = (unsigned)value;
             } else if (option == 'm') {
                 if (value > GW_MAX_NODES)
                     return -1;
@@ -2132,10 +2382,14 @@ static int options(int argc, char **argv) {
     }
     if (optind != argc || g.ws_port == g.api_port ||
         (g.alt_ws_port && (g.alt_ws_port == g.ws_port || g.alt_ws_port == g.api_port)) ||
+        (g.alt_ws6_port && (g.alt_ws6_port == g.ws_port || g.alt_ws6_port == g.api_port)) ||
+        (g.alt_ws6_port && !*g.bind6) || (*g.api_bind6 && !*g.bind6) ||
         !*g.database)
         return -1;
     if (!*g.api_bind)
         strcpy(g.api_bind, g.bind);
+    if (*g.bind6 && !*g.api_bind6)
+        strcpy(g.api_bind6, g.bind6);
     /* Upgrade packages sit beside the database so one backup captures both. */
     {
         const char *slash = strrchr(g.database, '/');
@@ -2148,8 +2402,11 @@ static int options(int argc, char **argv) {
             snprintf(g.update_dir, sizeof(g.update_dir), "updates");
         }
     }
-    struct in_addr address;
-    if (inet_pton(AF_INET, g.bind, &address) != 1 || inet_pton(AF_INET, g.api_bind, &address) != 1)
+    /* --bind / --apibind may now hold an IPv6 literal too; both families are
+     * validated the same way so a typo cannot silently fall back. */
+    if (!bind_text_valid(g.bind) || !bind_text_valid(g.api_bind) ||
+        (*g.bind6 && !bind_text_valid(g.bind6)) ||
+        (*g.api_bind6 && !bind_text_valid(g.api_bind6)))
         return -1;
     g.user = getenv("FASTP2P_USER");
     g.password = getenv("FASTP2P_PASSWORD");
@@ -2163,7 +2420,8 @@ static int options(int argc, char **argv) {
         return -1;
     if (!g.public_host || !*g.public_host)
         g.public_host = strcmp(g.bind, "0.0.0.0") ? g.bind : "127.0.0.1";
-    if (!fastp2p_enrollment_host_valid(g.public_host))
+    /* SPEC §7: an IPv6 literal is a legal public host; URLs bracket it later. */
+    if (!fastp2p_enrollment_host_valid(g.public_host) && !gw_is_ipv6_literal(g.public_host))
         return -1;
     /* Kept across the call because the global below points at it. */
     static char automatic_ca[4096];
@@ -2183,9 +2441,17 @@ static int options(int argc, char **argv) {
         if (bad) return -1;
         g.enrollment_ca[length] = 0;
     }
-    char *profile = fastp2p_enrollment_encode(g.public_host, g.ws_port, g.token, g.enrollment_ca);
-    if (!profile) return -1;
-    OPENSSL_cleanse(profile, strlen(profile)); free(profile);
+    /* SPEC §9: IPv6 install-token envelopes are explicitly out of scope this
+     * cycle, and fastp2p_enrollment_encode() (shared code) still only accepts
+     * hostname/IPv4. A v6 literal public host therefore keeps working for URLs,
+     * presets and the installer, but skips the envelope self-check. */
+    if (!gw_is_ipv6_literal(g.public_host)) {
+        /* Kept across the call because the global below points at it. */
+        char *profile = fastp2p_enrollment_encode(g.public_host, g.ws_port, g.token,
+                                                  g.enrollment_ca);
+        if (!profile) return -1;
+        OPENSSL_cleanse(profile, strlen(profile)); free(profile);
+    }
     return 0;
 }
 int main(int argc, char **argv) {
@@ -2223,7 +2489,7 @@ sqlite3_close(g.db); return 1;
         puts("Gateway account reset from FASTP2P_USER and FASTP2P_PASSWORD");
 sqlite3_close(g.db); return 0;
     }
-    if (gw_nat_start(&g.nat, g.bind)) {
+    if (gw_nat_start(&g.nat, g.bind, g.bind6)) {
         fputs("Cannot bind NAT ports\n", stderr);
 sqlite3_close(g.db);
         return 1;
@@ -2231,8 +2497,10 @@ sqlite3_close(g.db);
     struct lws_context_creation_info info;
     memset(&info, 0, sizeof(info));
     info.port = CONTEXT_PORT_NO_LISTEN;
-    info.options = LWS_SERVER_OPTION_EXPLICIT_VHOSTS | LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT |
-                   LWS_SERVER_OPTION_DISABLE_IPV6;
+    /* IPv6 is no longer disabled at context level: every family gets its own
+     * explicitly created vhost below, so a v4-only configuration still creates
+     * exactly the same listeners as before. */
+    info.options = LWS_SERVER_OPTION_EXPLICIT_VHOSTS | LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
     info.uid = -1;
     info.gid = -1;
     info.fd_limit_per_thread = 1024;
@@ -2245,7 +2513,8 @@ sqlite3_close(g.db);
         goto failed;
     }
     memset(&info, 0, sizeof(info));
-    info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT | LWS_SERVER_OPTION_DISABLE_IPV6;
+    info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT | LWS_SERVER_OPTION_IPV6_V6ONLY_MODIFY |
+                   LWS_SERVER_OPTION_IPV6_V6ONLY_VALUE;
     info.protocols = protocols;
     info.ssl_cert_filepath = g.cert;
     info.ssl_private_key_filepath = g.key;
@@ -2273,13 +2542,46 @@ sqlite3_close(g.db);
     info.port = (int)g.api_port;
     info.vhost_name = "fastp2p-api";
     g.api_vhost = lws_create_vhost(g.context, &info);
+    /* Independent IPv6 listeners, created only when --bind6 was given: the WSS
+     * vhost first, then the optional alt WSS, then the API vhost. */
+    g.ws_vhost6 = g.ws_alt_vhost6 = g.api_vhost6 = NULL;
+    if (*g.bind6) {
+        info.iface = g.bind6;
+        info.port = (int)g.ws_port;
+        info.vhost_name = "fastp2p-wss6";
+        g.ws_vhost6 = lws_create_vhost(g.context, &info);
+        if (!g.ws_vhost6) {
+            fputs("Cannot bind the IPv6 WSS port\n", stderr);
+            goto failed;
+        }
+        if (g.alt_ws6_port) {
+            info.iface = g.bind6;
+            info.port = (int)g.alt_ws6_port;
+            info.vhost_name = "fastp2p-wss6-alt";
+            g.ws_alt_vhost6 = lws_create_vhost(g.context, &info);
+            if (!g.ws_alt_vhost6) {
+                fputs("Cannot bind the IPv6 alternate WSS port\n", stderr);
+                goto failed;
+            }
+        }
+        info.iface = g.api_bind6;
+        info.port = (int)g.api_port;
+        info.vhost_name = "fastp2p-api6";
+        g.api_vhost6 = lws_create_vhost(g.context, &info);
+        if (!g.api_vhost6) {
+            fputs("Cannot bind the IPv6 API port\n", stderr);
+            goto failed;
+        }
+    }
     if (!g.ws_vhost || !g.api_vhost) {
         fputs("Cannot load TLS certificate/key or bind HTTPS/WSS ports\n", stderr);
         goto failed;
     }
     g.started_ms = gw_mono_ms();
     printf("{\"event\":\"ready\",\"version\":\"%s\",\"wss\":%u,\"wssAlt\":%u,"
-           "\"api\":%u}\n", GW_VERSION, g.ws_port, g.alt_ws_port, g.api_port);
+           "\"api\":%u,\"ipv6\":%d,\"wss6\":%u,\"api6\":%u}\n",
+           GW_VERSION, g.ws_port, g.alt_ws_port, g.api_port, g.ws_vhost6 ? 1 : 0,
+           g.ws_vhost6 ? g.ws_port : 0, g.api_vhost6 ? g.api_port : 0);
     fflush(stdout);
     lws_sul_schedule(g.context, 0, &g.tick, tick, 10000);
     uint64_t end = g.run_seconds ? gw_mono_ms() + (uint64_t)g.run_seconds * 1000 : 0;

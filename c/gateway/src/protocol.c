@@ -1,5 +1,6 @@
 #include "protocol.h"
 #include "utf8.h"
+#include <arpa/inet.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
@@ -220,4 +221,20 @@ void gw_js(json_object *j, const char *name, const char *text) {
 }
 void gw_ju(json_object *j, const char *name, uint64_t value) {
     json_object_object_add(j, name, json_object_new_uint64(value));
+}
+int gw_is_ipv6_literal(const char *text) {
+    struct in6_addr scratch;
+    /* inet_pton(AF_INET6) already rejects brackets, embedded ports and %scope,
+     * which is exactly the "canonical bare address" the spec allows. */
+    return text && *text && inet_pton(AF_INET6, text, &scratch) == 1;
+}
+void gw_host_url_authority(char *out, size_t capacity, const char *host) {
+    if (capacity)
+        out[0] = 0;
+    if (!out || !capacity || !host)
+        return;
+    if (gw_is_ipv6_literal(host))
+        snprintf(out, capacity, "[%s]", host);
+    else
+        snprintf(out, capacity, "%s", host);
 }

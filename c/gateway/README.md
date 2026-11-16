@@ -14,6 +14,8 @@ Linux C11 网关提供 HTTPS/WSS、NAT 探测、连接协调、中继候选选�
 bash c/gateway/scripts/build-static.sh x86_64
 ```
 
+> 双栈注意：静态构建现在以 `-DLWS_IPV6=ON` 编译 libwebsockets，静态包同样支持 `--bind6`/`--apibind6`。若使用系统库构建（Debian 的 `libwebsockets-dev` 默认 `-DLWS_IPV6=ON`）行为一致。
+
 本地开发也可以直接链接系统库（Debian 12/13）：
 
 ```sh
@@ -37,7 +39,15 @@ bash scripts/tls/generate-cert.sh /private/tls gateway.example.com 127.0.0.1
 build/c-gateway/fastp2p-gateway --bind 0.0.0.0 --apibind 127.0.0.1
 ```
 
-默认 WSS TCP 27183；TCP NAT 27180–27181；UDP NAT 27180–27183；Web/API HTTPS 127.0.0.1:10008。远程管理通过 SSH 转发访问。Web 可查看在线/离线节点、搜索分页、转发规则和安装 Token。中继候选排除两个端点本身、对称 NAT 节点和协议主版本不同的节点，并按最久未使用优先分配；客户端最多同时中继 4 条会话，超限即拒绝加入，端点随即改用其他候选。
+IPv6 双栈按需追加参数，每族独立监听、互不影响；不给 `--bind6` 时行为与纯 IPv4 版本完全一致：
+
+```sh
+build/c-gateway/fastp2p-gateway --bind 0.0.0.0 --bind6 :: --apibind 127.0.0.1 --altwss6 443
+```
+
+`--bind6`/`--apibind6` 接受 IPv6 字面量（`::`、`::1`、`2001:db8::1`）。WSS、API 与可选 alt WSS 各自再开一个 v6 vhost，NAT 探测端口（TCP 27180–27181、UDP 27180–27183）也按族各绑一套。`FASTP2P_PUBLIC_HOST` 或 `--public-host` 写成 v6 字面量时，升级下载 URL、安装脚本与控制台预设会自动加方括号。
+
+默认 WSS TCP 27183；TCP NAT 27180–27181；UDP NAT 27180–27183；Web/API HTTPS 127.0.0.1:10008。远程管理通过 SSH 转发访问。Web 可查看在线/离线节点、搜索分页、转发规则和安装 Token。中继候选排除两个端点本身、对称 NAT 节点、协议主版本不同的节点，以及不能覆盖两端公共地址族的节点（v4-only 中继永不会被选给 v6 端点对），并按最久未使用优先分配；客户端最多同时中继 4 条会话，超限即拒绝加入，端点随即改用其他候选。
 
 SQLite 使用回滚日志和同步写入，文件权限 0600；通过 SQLite 在线备份接口备份。旧 C 数据库可以保留记录升级 application_id；回退旧程序前应恢复升级前数据库快照。
 
@@ -59,7 +69,7 @@ Web 右上角“账号设置”可修改账号和密码，需要输入当前密�
 
 离线节点的操作列提供“删除”，确认后移除 SQLite 登记记录及名称保留；在线节点不能删除。删除记录不撤销安装 Token，仍持有有效 Token 的设备再次上线会重新登记。
 
-数据库核心 schema version 4。包下载租约与待删除文件使用附加表，不改变节点身份或规则。同步 GitHub 最新稳定客户端成功后，自动清理较低版本的镜像包和手动上传包；相同或更高版本保留。正在下载/已下发升级的版本暂缓清理，后台每分钟重试过期租约和删除失败项；同步失败保留现有包。
+数据库核心 schema 版本为 `PRAGMA user_version=7`（5 增加按 TCP NAT 列，6 增加 IPv6 侧 `nat6`/`tcp_nat6`/`tcp_nat6_samples`/`tcp_nat6_ips` 与 `families` 列，7 增加 `nat_level`：NAT1–NAT4 等级，0 未知，5 表示映射为锥形但当时没有第二个节点可验证入站过滤，全部以 `ALTER TABLE ADD COLUMN` 就地迁移并保留既有行；旧版本库直接打开即升级）。包下载租约与待删除文件使用附加表，不改变节点身份或规则。同步 GitHub 最新稳定客户端成功后，自动清理较低版本的镜像包和手动上传包；相同或更高版本保留。正在下载/已下发升级的版本暂缓清理，后台每分钟重试过期租约和删除失败项；同步失败保留现有包。
 
 Linux 控制台只提供一个通用 shell 安装脚本：`GET /api/v1/update/install?platform=linux`。脚本包含各架构最新可用包的版本、长度、SHA-256、网关地址、公开 CA 和独立系统服务脚本，不包含 ELF；执行时自动识别 CPU，从网关的公开 WSS 端口通过 HTTPS 下载原始程序。设备需要 curl 或启用 TLS 的 GNU wget。Token 只放在 16 位数字的下载文件名中，不进入共享缓存；下载器用私有配置文件传递 `Authorization: FastP2P <Token>`，不泄露到 URL 或下载器参数。下载端点保留旧客户端的 query Token 兼容，只允许获取程序，不授予管理权限。客户端远程升级接口仍提供原始可执行文件，按架构存储的包不受 UI 合并影响。旧的指定架构、版本的安装 URL 仍可使用，返回包含该版本各架构清单的通用脚本。已清理旧包时需重新下载脚本。修改安装脚本后须重新构建网关（Docker 构建上下文使用仓库根目录）。
 
@@ -69,6 +79,4 @@ Linux 控制台只提供一个通用 shell 安装脚本：`GET /api/v1/update/in
 
 ## 客户端配置下发
 
-新版 Linux/Windows/macOS CLI 的「配置」按钮可编辑网关管理的 JSON 字段，按键值递归合并到客户端 config/fastp2p.conf，未下发字段保留，数组整体替换。客户端自动重载，确认新连接成功才显示 applied；失败会恢复原配置并反馈 failed。Windows 保持 DPAPI 加密。SDK/Android 需由宿主注册配置处理回调后才支持此功能。
-
-接口为登录后 GET/POST `/api/v1/device/<节点名>/config`，POST 请求体 `{ "fields": { "network": { "PublicIPPort": 12345 } } }`。SQLite 的 node_configs 记录期望字段、版本及状态，离线时排队，上线后重发。转发规则和文件配置共用同一份期望状态；删除离线节点也会清理其规则及下发配置。
+控制台的手动字段配置对话框已移除：`/api/v1/device/<节点名>/config` 现在返回 410，操作员不能再向节点提交任意 JSON。转发规则与 SOCKS5 入口仍由网关数据库托管，并通过同一份版本化期望状态（main 3 sub 19）在下发、停用与删除时同步到在线客户端；离线客户端在下次连接后收到。`node_configs` 表继续记录期望状态、版本与确认结果，删除离线节点同样清理其规则及下发配置。

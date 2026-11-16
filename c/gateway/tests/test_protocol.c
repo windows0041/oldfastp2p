@@ -78,6 +78,18 @@ int main(void) {
     jwt[10] = jwt[10] == 'A' ? 'B' : 'A';
     assert(!gw_jwt_verify(jwt, "test-user", token, "test-secret", now));
     free(jwt);
-    puts("Wire, uint64, CRC64, TOTP and JWT checks passed");
+    /* DUALSTACK-SPEC §3/§7: URL authorities bracket only real IPv6 literals. */
+    char authority[64];
+    assert(gw_is_ipv6_literal("2001:db8::1") && gw_is_ipv6_literal("::1"));
+    assert(!gw_is_ipv6_literal("127.0.0.1") && !gw_is_ipv6_literal("gateway.example.com"));
+    assert(!gw_is_ipv6_literal("[2001:db8::1]") && !gw_is_ipv6_literal("fe80::1%eth0") &&
+           !gw_is_ipv6_literal(""));
+    gw_host_url_authority(authority, sizeof(authority), "2001:db8::1");
+    assert(!strcmp(authority, "[2001:db8::1]"));
+    gw_host_url_authority(authority, sizeof(authority), "gateway.example.com");
+    assert(!strcmp(authority, "gateway.example.com"));
+    gw_host_url_authority(authority, sizeof(authority), "127.0.0.1");
+    assert(!strcmp(authority, "127.0.0.1"));
+    puts("Wire, uint64, CRC64, TOTP, JWT and dual-stack URL checks passed");
     return 0;
 }

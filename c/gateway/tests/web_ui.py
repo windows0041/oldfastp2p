@@ -195,26 +195,17 @@ def main():
                 expect(page.locator('#rules').get_by_role('button',name='编辑')).to_have_count(1)
                 results['C_capabilities_and_add_forward']=True
                 if args.client:
-                    page.get_by_role('button',name='配置节点 web-c-node',exact=True).click()
-                    expect(page.locator('#config-fields')).to_have_value(__import__('re').compile(r'"apps"'))
-                    page.locator('#config-fields').fill(json.dumps({'custom':{'nested':{'update':2},'web':True}}))
-                    page.locator('#save-config').click()
-                    deadline=time.monotonic()+45
-                    while '客户端已确认配置生效' not in page.locator('#config-status').inner_text():
-                        assert '未能应用' not in page.locator('#config-status').inner_text(),'Client rejected browser configuration; inspect fixture logs'
-                        assert time.monotonic()<deadline,'Configuration confirmation timed out'
-                        time.sleep(.15)
-                    # Windows can briefly cache a DrvFs directory entry across
-                    # the WSL client's atomic rename; wait for the new file view.
-                    deadline=time.monotonic()+5
-                    while True:
-                        saved=json.loads((root/'config/fastp2p.conf').read_text(encoding='utf-8'))
-                        if saved['custom']=={'nested':{'keep':42,'update':2},'web':True} and saved['apps']:break
-                        assert time.monotonic()<deadline,'Confirmed config was not persisted'
-                        time.sleep(.1)
-                    page.screenshot(path=str(args.output/'config-field-merge.png'),full_page=True)
-                    page.locator('#close-config').click()
-                    results['configuration_dialog_field_merge_and_real_C_reload_confirmation']=True
+                    # Manual field configuration was removed from the console: the
+                    # gateway refuses the endpoint with 410, and the dialog is gone.
+                    status=page.evaluate('''async () => {
+                        const session=JSON.parse(sessionStorage.getItem('fastp2p.console')||'{}');
+                        const r=await fetch('/api/v1/device/web-c-node/config',{headers:{Authorization:'Bearer '+session.token}});
+                        return r.status;
+                    }''')
+                    assert status==410,status
+                    assert page.get_by_role('button',name='配置节点 web-c-node',exact=True).count()==0
+                    assert page.locator('#config-fields').count()==0
+                    results['manual_config_endpoint_retired_410_and_no_dialog']=True
                 page.locator('#node-search').fill('');page.locator('#nodes tr').filter(has_text=go.name).get_by_role('button').click()
                 # Rules are served from the gateway database, so seed the row the
                 # console will read instead of relying on a client-side report.

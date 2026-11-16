@@ -15,10 +15,11 @@ ctest --test-dir "$build" --output-on-failure
 runtime=$(mktemp -d /tmp/fastp2p-gateway-protocol.XXXXXXXX)
 chmod 700 "$runtime"
 echo "Private protocol logs: $runtime"
-bash "$repository/scripts/tls/generate-cert.sh" "$runtime/certs" localhost 127.0.0.1 > "$runtime/certificate-generation.log" 2>&1
+bash "$repository/scripts/tls/generate-cert.sh" "$runtime/certs" localhost 127.0.0.1 ::1 > "$runtime/certificate-generation.log" 2>&1
 exec unshare --net bash -c '
   set -euo pipefail
   ip link set lo up
   python3 "$1/c/gateway/tests/protocol_integration.py" --gateway "$2" --cert-dir "$3/certs" --logs "$3/logs"
+  python3 "$1/c/gateway/tests/dualstack_integration.py" --gateway "$2" --cert-dir "$3/certs" --logs "$3/dualstack"
   exec python3 "$1/c/gateway/tests/admin_integration.py" --gateway "$2" --cert-dir "$3/certs" --logs "$3/admin-logs"
 ' _ "$repository" "$build/fastp2p-gateway" "$runtime"

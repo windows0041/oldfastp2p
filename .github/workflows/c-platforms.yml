@@ -262,6 +262,13 @@ jobs:
           ctest --test-dir build/c-gateway --output-on-failure
       - name: TCP punching through two filtered NAT routers with UDP blocked
         run: unshare --net python3 c/client/tests/tcp_nat3_integration.py --client build/c/fastp2p --gateway build/c-gateway/fastp2p-gateway --logs build/c/tcp-nat3
+      - name: Dual-stack registration, per-family NAT levels and an IPv6 tunnel
+        run: |
+          bash scripts/tls/generate-cert.sh build/dualstack-certs localhost 127.0.0.1 ::1 10.203.0.1 >/dev/null
+          unshare --net sh -c 'ip link set lo up && python3 c/client/tests/dualstack_integration.py --gateway build/c-gateway/fastp2p-gateway --c-client build/c/fastp2p --cert-dir build/dualstack-certs --logs build/c/dualstack'
+      - name: NAT level detection with a foreign-source probe between two sites
+        run: |
+          unshare --net sh -c 'ip link set lo up && python3 c/client/tests/natlevel_integration.py --gateway build/c-gateway/fastp2p-gateway --c-client build/c/fastp2p --cert-dir build/dualstack-certs --logs build/c/natlevel'
       - name: C SOCKS5, QUIC and token enrollment
         run: |
           bash c/client/scripts/check-socks.sh

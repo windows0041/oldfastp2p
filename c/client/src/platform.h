@@ -68,6 +68,52 @@ typedef intptr_t op_socket;
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
 #endif
+/* One endpoint of either family. The socket calls below already take a sockaddr
+ * plus its real length, so dual-stack work is a text/address concern, not a
+ * socket-API concern: every address the client stores becomes an op_addr or its
+ * canonical text, and lengths travel with it instead of being assumed. */
+typedef struct {
+    union {
+        struct sockaddr sa;
+        struct sockaddr_in in;
+        struct sockaddr_in6 in6;
+        struct sockaddr_storage storage;
+    } u;
+    op_socklen len;
+} op_addr;
+#define OP_ADDR_TEXT 46 /* fits IPv6 text; also fits IPv4 text */
+#define OP_FAM_V4 0
+#define OP_FAM_V6 1
+#define OP_FAM_COUNT 2
+/* 0 = IPv4, 1 = IPv6, -1 = not a supported family. */
+int op_family_index(int family);
+int op_index_family(int index);
+/* Fills the endpoint from canonical text (no brackets), inferring the family.
+ * Port is host order. Returns 0 on success. */
+int op_addr_from_text(op_addr *out, const char *text, uint16_t port);
+/* Canonical text, no brackets; URL callers add them for IPv6. */
+int op_addr_text(const op_addr *a, char *out, size_t capacity);
+int op_addr_family(const op_addr *a);
+uint16_t op_addr_port(const op_addr *a);
+void op_addr_set_port(op_addr *a, uint16_t port);
+void op_addr_copy(op_addr *dst, const op_addr *src);
+/* Same endpoint ignoring the port. */
+int op_addr_equal(const op_addr *a, const op_addr *b);
+/* Collapses an IPv4-mapped IPv6 endpoint into IPv4 so a dual-stack listener
+ * cannot present one peer as two different ones. */
+void op_addr_normalize(op_addr *a);
+/* 1 when a peer could reach this address over the internet: IPv4 global
+ * unicast, or IPv6 global/ULA. Loopback, unspecified, link-local and the other
+ * IPv4-special ranges give 0. */
+int op_addr_routable(const op_addr *a);
+/* 1 for loopback or a site-local range (RFC 1918, fe80::/10, fc00::/7): a peer
+ * holding one of these is reachable without punching through a NAT. */
+int op_addr_private(const op_addr *a);
+/* Local and remote endpoints of a socket, normalized. These replace the old
+ * habit of reading the family-independent port alone: a socket that connected
+ * over IPv6 reports its IPv6 source, which the text field must be able to hold. */
+int op_addr_socketname(op_socket fd, op_addr *out);
+int op_addr_peername(op_socket fd, op_addr *out);
 int op_platform_init(void);
 int op_hostname(char *out, size_t capacity);
 void op_once_run(op_once *once, void (*function)(void));
@@ -82,6 +128,7 @@ int op_bind(op_socket fd, const struct sockaddr *address, op_socklen length);
 int op_connect(op_socket fd, const struct sockaddr *address, op_socklen length);
 int op_listen(op_socket fd, int backlog);
 int op_getsockname(op_socket fd, struct sockaddr *address, op_socklen *length);
+int op_getpeername(op_socket fd, struct sockaddr *address, op_socklen *length);
 int op_setsockopt(op_socket fd, int level, int option, const void *value, op_socklen length);
 int op_getsockopt(op_socket fd, int level, int option, void *value, op_socklen *length);
 int op_reuse_socket(op_socket fd);

@@ -18,6 +18,9 @@ static void migrate_nat(void) {
     json_object *list=gw_store_list(db,"existing-node",10,0);assert(list);
     json_object *node=json_object_array_get_idx(gw_get(list,"nodes"),0);assert(node);
     assert(gw_integer(node,"udpNatType")==2 && gw_integer(node,"tcpNatType")==314 && !gw_integer(node,"isActive"));
+    /* The dual-stack columns arrive with the schema defaults, not zeros. */
+    assert(gw_integer(node,"udpNatType6")==314 && gw_integer(node,"tcpNatType6")==314);
+    assert(gw_integer(node,"tcpNatSamples6")==0 && gw_integer(node,"families")==1);
     json_object_put(list);
     struct connection connection={.nat=2,.tcp_nat=1,.tcp_nat_samples=4,.tcp_nat_ips=3};
     strcpy(connection.node,"existing-node");assert(!gw_store_save(db,&connection,1));sqlite3_close(db);
@@ -27,8 +30,64 @@ static void migrate_nat(void) {
            gw_integer(node,"tcpNatSamples")==4 && gw_integer(node,"tcpNatDestinationIPs")==3);
     json_object_put(list);sqlite3_close(db);unlink(path);
 }
+/* DUALSTACK-SPEC §4: a user_version 5 database keeps every legacy row and the
+ * *6 columns plus families migrate in with their "unknown / IPv4-only"
+ * defaults; a save round-trip must persist the per-family levels. */
+static void migrate_dualstack(void) {
+    char path[]="/tmp/fastp2p-store-v5-XXXXXX";int fd=mkstemp(path);assert(fd>=0);close(fd);
+    sqlite3 *db=NULL;assert(sqlite3_open(path,&db)==SQLITE_OK);
+    assert(!sqlite3_exec(db,"CREATE TABLE nodes(name TEXT PRIMARY KEY,node_id TEXT UNIQUE,device_id TEXT,"
+        "hostname TEXT NOT NULL DEFAULT '',ip TEXT NOT NULL DEFAULT '',ipv6 TEXT NOT NULL DEFAULT '',"
+        "lanip TEXT NOT NULL DEFAULT '',mac TEXT NOT NULL DEFAULT '',os TEXT NOT NULL DEFAULT '',"
+        "version TEXT NOT NULL DEFAULT '',nat INTEGER NOT NULL DEFAULT 314,bandwidth INTEGER NOT NULL DEFAULT 0,"
+        "first_seen INTEGER NOT NULL,last_seen INTEGER NOT NULL,last_offline INTEGER NOT NULL DEFAULT 0,"
+        "online INTEGER NOT NULL DEFAULT 0 CHECK(online IN(0,1)),tcp_nat INTEGER NOT NULL DEFAULT 314,"
+        "tcp_nat_samples INTEGER NOT NULL DEFAULT 0,tcp_nat_ips INTEGER NOT NULL DEFAULT 0);"
+        "INSERT INTO nodes(name,node_id,ip,nat,tcp_nat,tcp_nat_samples,tcp_nat_ips,first_seen,last_seen,online)"
+        " VALUES('legacy-node','7','192.0.2.9',2,1,4,3,10,20,1);"
+        "PRAGMA application_id=1179660880; PRAGMA user_version=5;",NULL,NULL,NULL));
+    sqlite3_close(db);
+    assert(!gw_store_open(&db,path));
+    sqlite3_stmt *statement=NULL;
+    assert(!sqlite3_prepare_v2(db,"PRAGMA user_version",-1,&statement,NULL));
+    assert(sqlite3_step(statement)==SQLITE_ROW && sqlite3_column_int(statement,0)==7);
+    sqlite3_finalize(statement);
+    json_object *list=gw_store_list(db,"legacy-node",10,0);assert(list);
+    json_object *node=json_object_array_get_idx(gw_get(list,"nodes"),0);assert(node);
+    assert(gw_integer(node,"udpNatType")==2 && gw_integer(node,"tcpNatType")==1 &&
+           gw_integer(node,"tcpNatSamples")==4 && gw_integer(node,"tcpNatDestinationIPs")==3);
+    assert(gw_integer(node,"udpNatType6")==314 && gw_integer(node,"tcpNatType6")==314 &&
+           gw_integer(node,"tcpNatSamples6")==0 && gw_integer(node,"families")==1);
+    json_object_put(list);
+    struct connection connection={.nat=2,.tcp_nat=1,.tcp_nat_samples=4,.tcp_nat_ips=3,
+        .nat6=1,.tcp_nat6=2,.tcp_nat6_samples=6,.tcp_nat6_ips=4,.families=3,.nat_level=2};
+    strcpy(connection.node,"legacy-node");strcpy(connection.ip,"192.0.2.9");
+    strcpy(connection.ipv6,"2001:db8::1");
+    connection.last_seen_wall=gw_wall_ns();
+    assert(!gw_store_save(db,&connection,1));
+    sqlite3_close(db);assert(!gw_store_open(&db,path));
+    list=gw_store_list(db,"legacy-node",10,0);assert(list);
+    node=json_object_array_get_idx(gw_get(list,"nodes"),0);assert(node);
+    assert(!strcmp(gw_string(node,"ipv6"),"2001:db8::1"));
+    assert(gw_integer(node,"udpNatType6")==1 && gw_integer(node,"tcpNatType6")==2 &&
+           gw_integer(node,"tcpNatSamples6")==6 && gw_integer(node,"tcpNatDestinationIPs6")==4 &&
+           gw_integer(node,"families")==3 && gw_integer(node,"natLevel")==2);
+    json_object_put(list);
+    /* A zeroed connection must not downgrade families to an illegal value. */
+    struct connection blank={0};strcpy(blank.node,"legacy-node");
+    strcpy(blank.ip,"192.0.2.9");
+    assert(!gw_store_save(db,&blank,1));
+    list=gw_store_list(db,"legacy-node",10,0);
+    node=json_object_array_get_idx(gw_get(list,"nodes"),0);
+    assert(gw_integer(node,"families")==1 && gw_integer(node,"udpNatType6")==314);
+    json_object_put(list);
+    /* tcpNatDestinationIPs6 above the sample count is rejected upstream by
+     * nat_fields(); the store itself is the last writer, so just close it out. */
+    sqlite3_close(db);unlink(path);
+}
 int main(void) {
     migrate_nat();
+    migrate_dualstack();
     char path[] = "/tmp/fastp2p-store-XXXXXX";
     int fd = mkstemp(path);
     assert(fd >= 0); close(fd);
