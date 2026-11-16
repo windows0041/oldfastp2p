@@ -198,6 +198,7 @@ typedef struct {
     char socks_user[256], socks_password[256];
     uint16_t port, dst_port;
     int attempts, relay_wanted, relay_requested;
+    int lan_tried; /* the LAN punch was already attempted for this rule */
     /* Operator-chosen relay for this rule; empty means automatic. */
     char relay_node[32];
     uint64_t peer_nat, peer_tcp_nat, link_deadline;
@@ -2540,6 +2541,21 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                             copy_string(c->apps[i].peer_lan6, sizeof(c->apps[i].peer_lan6),
                                         lan6);
                     }
+                    /* The peer's private address only arrives with this answer, long
+                     * after the rule was created and possibly after a WAN punch or a
+                     * relay link was already chosen. A LAN link is cheaper and does not
+                     * depend on the relay, so drop a link that is still not ready and
+                     * let the app loop re-decide with the LAN path available. A link
+                     * that already carries traffic is left alone. */
+                    if (c->apps[i].peer_lan[0] && !c->apps[i].lan_tried &&
+                        lan_punch_possible(c, &c->apps[i])) {
+                        int index = c->apps[i].tunnel_index;
+                        if (index >= 0 && c->tunnels[index].state &&
+                            !c->tunnels[index].lan && !tunnel_ready(&c->tunnels[index]))
+                            close_tunnel(c, index, "peer LAN address reachable; trying a direct LAN punch");
+                        c->apps[i].tunnel_index = -1;
+                        c->apps[i].retry = mono();
+                    }
                 }
     } else if (main == 3 && sub == 7)
         report_apps(c);
@@ -3443,6 +3459,7 @@ static void tick_apps(fastp2p_client *c, uint64_t now) {
                         ti = app_tunnel(c, a, a->peer, a->transport);
                         if (ti >= 0) {
                             c->tunnels[ti].lan = 1;
+                            a->lan_tried = 1;
                             start_punch(c, ti);
                         }
                     } else if (a->relay_node[0] || a->attempts >= 2 || c->force_relay ||
