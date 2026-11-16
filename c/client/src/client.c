@@ -128,6 +128,10 @@ typedef struct {
     int port_supported, ip_supported;
     int has_alternate; /* some server advertised its alternate address */
     int level; /* 0 = STUN produced no verdict */
+    /* One retransmission per phase: a single lost datagram (common right after
+     * startup, while DNS and routing settle) must not throw away the mapping and
+     * turn a measurable NAT into "unknown". */
+    int retried;
 } nat_stun;
 typedef struct {
     int state, server, initiator, transport, notified;
@@ -4045,6 +4049,7 @@ static void nat_stun_send(fastp2p_client *c) {
         (void)op_sendto(s->fd, request, length, MSG_DONTWAIT, &s->addr[s->server].u.sa,
                         s->addr[s->server].len);
     s->deadline = mono() + 1200 * MS;
+    s->retried = 0;
 }
 static void nat_stun_finish(fastp2p_client *c) {
     nat_stun *s = &c->stun;
@@ -4182,6 +4187,14 @@ static void nat_stun_step(fastp2p_client *c, uint64_t now) {
     }
     if (now < s->deadline)
         return;
+    /* Retry this phase once before reading anything into its silence: at startup
+     * the first datagram is the one most likely to be lost, and losing it would
+     * cost the mapping that the whole verdict depends on. */
+    if (!s->retried) {
+        nat_stun_send(c); /* resets `retried`, so set the flag afterwards */
+        s->retried = 1;
+        return;
+    }
     /* Move on: a missing reply is itself information (that variant was filtered
      * out), and the next server or phase may still answer. */
     ++s->phase;
