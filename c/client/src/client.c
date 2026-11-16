@@ -4070,7 +4070,6 @@ static void nat_stun_send(fastp2p_client *c) {
         (void)op_sendto(s->fd, request, length, MSG_DONTWAIT, &s->addr[s->server].u.sa,
                         s->addr[s->server].len);
     s->deadline = mono() + 1200 * MS;
-    s->retried = 0;
 }
 static void nat_stun_finish(fastp2p_client *c) {
     nat_stun *s = &c->stun;
@@ -4152,6 +4151,7 @@ static void nat_stun_start(fastp2p_client *c) {
     s->phase = 1;
     /* Assume cone until a server reports a different mapping. */
     s->mapped_same = 1;
+    s->retried = 0;
     s->fd = socket_bound(1, NULL, 0, 0);
     if (s->fd < 0) {
         s->phase = 4;
@@ -4217,6 +4217,7 @@ static void nat_stun_step(fastp2p_client *c, uint64_t now) {
                     nat_stun_finish(c);
                     return;
                 }
+                s->retried = 0;
                 nat_stun_send(c);
                 return;
             }
@@ -4227,14 +4228,19 @@ static void nat_stun_step(fastp2p_client *c, uint64_t now) {
     /* Retry this phase once before reading anything into its silence: at startup
      * the first datagram is the one most likely to be lost, and losing it would
      * cost the mapping that the whole verdict depends on. */
-    if (!s->retried) {
-        nat_stun_send(c); /* resets `retried`, so set the flag afterwards */
-        s->retried = 1;
+    /* The mapping phase gets two retries: everything else is derived from it, and a
+     * NAT that has just seen a new client can drop the first couple of datagrams
+     * while it creates the state. A filtered reply is still information, so the
+     * other phases only try once more. */
+    if (s->retried < (s->phase == 1 ? 2 : 1)) {
+        ++s->retried;
+        nat_stun_send(c);
         return;
     }
     /* Move on: a missing reply is itself information (that variant was filtered
      * out), and the next server or phase may still answer. */
     ++s->phase;
+    s->retried = 0;
     if (s->phase > 3) {
         ++s->server;
         s->phase = 1;
