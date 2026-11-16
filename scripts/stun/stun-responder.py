@@ -35,6 +35,7 @@ BINDING_SUCCESS = 0x0101
 ATTR_MAPPED = 0x0001
 ATTR_CHANGE_REQUEST = 0x0003
 ATTR_XOR_MAPPED = 0x0020
+ATTR_OTHER_ADDRESS = 0x802C
 
 
 def local_addresses():
@@ -68,14 +69,30 @@ def local_addresses():
     return addresses
 
 
-def build_response(transaction, address, port):
-    """XOR-MAPPED-ADDRESS per RFC 5389 鎼?5.2 (IPv4)."""
-    xport = port ^ (MAGIC >> 16)
-    cookie = struct.pack('!I', MAGIC)
-    packed = bytes(a ^ b for a, b in zip(socket.inet_aton(address), cookie))
-    value = bytes([0, 1]) + struct.pack('!H', xport) + packed
-    attr = struct.pack('!HH', ATTR_XOR_MAPPED, len(value)) + value
-    return struct.pack('!HHI', BINDING_SUCCESS, len(attr), MAGIC) + transaction + attr
+def _address_attribute(kind, address, port, xored):
+    if xored:
+        port_value = port ^ (MAGIC >> 16)
+        cookie = struct.pack('!I', MAGIC)
+        packed = bytes(a ^ b for a, b in zip(socket.inet_aton(address), cookie))
+    else:
+        port_value = port
+        packed = socket.inet_aton(address)
+    value = bytes([0, 1]) + struct.pack('!H', port_value) + packed
+    return struct.pack('!HH', kind, len(value)) + value
+
+
+def build_response(transaction, address, port, alternate=None):
+    """XOR-MAPPED-ADDRESS, plus RFC 5780 OTHER-ADDRESS when this host has a
+    second address.
+
+    Advertising OTHER-ADDRESS is what lets a client tell "the server can answer
+    from another address but my NAT dropped it" apart from "the server never
+    supported the request". Without that distinction a full-cone NAT is reported
+    as port-restricted."""
+    attrs = _address_attribute(ATTR_XOR_MAPPED, address, port, True)
+    if alternate:
+        attrs += _address_attribute(ATTR_OTHER_ADDRESS, alternate[0], alternate[1], False)
+    return struct.pack('!HHI', BINDING_SUCCESS, len(attrs), MAGIC) + transaction + attrs
 
 
 def parse_change_request(data):
@@ -139,7 +156,10 @@ def main():
             if out is None:
                 continue
             try:
-                out.sendto(build_response(transaction, peer[0], peer[1]), peer)
+                others = [a for a in addresses if a != address]
+                alternate = (others[0], target_port) if others else None
+                out.sendto(build_response(transaction, peer[0], peer[1], alternate),
+                            peer)
             except OSError:
                 continue
             if args.verbose:

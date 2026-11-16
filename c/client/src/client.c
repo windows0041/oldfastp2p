@@ -122,11 +122,11 @@ typedef struct {
     int mapped_seen;
     int mapped_same; /* every server reported the same mapping */
     int port_changed, ip_changed;
-    /* A server that answers a CHANGE-REQUEST from the same tuple simply ignores
-     * the attribute, so its silence proves nothing about our NAT. Only a reply
-     * from a different source shows the request reached a server that honours
-     * it - and only then does a *missing* reply mean the NAT filtered it. */
+    /* Only a reply from a different source shows a server honours the request;
+     * a server advertising OTHER-ADDRESS also declares it implements change-ip.
+     * Without either, a missing reply is not evidence of filtering. */
     int port_supported, ip_supported;
+    int has_alternate; /* some server advertised its alternate address */
     int level; /* 0 = STUN produced no verdict */
 } nat_stun;
 typedef struct {
@@ -4052,8 +4052,16 @@ static void nat_stun_finish(fastp2p_client *c) {
         op_close(s->fd);
     s->fd = -1;
     s->phase = 4;
-    /* Same mapping from every server that answered -> cone; anything else is a
-     * per-destination mapping, which is symmetric by definition. */
+    /* Same mapping from every destination -> cone; anything else is a
+     * per-destination mapping, which is symmetric by definition.
+     *
+     * The cone variants are only separated when the servers actually proved
+     * they implement the filtering extension: a reply from a different source,
+     * or an advertised OTHER-ADDRESS. Otherwise a missing reply is just as
+     * likely to mean "server ignored the attribute", and reporting NAT3 there
+     * would turn a full-cone network into a false "port restricted". */
+    int port_evidence = s->port_supported || s->has_alternate;
+    int ip_evidence = s->ip_supported || s->has_alternate;
     if (!s->mapped_seen)
         s->level = 0;
     else if (!s->mapped_same)
@@ -4061,18 +4069,20 @@ static void nat_stun_finish(fastp2p_client *c) {
     else if (s->ip_changed)
         s->level = 1;
     else if (s->port_changed)
-        s->level = 2;
+        /* Another port got through, so not port-restricted. Whether a stranger
+         * address would also be accepted is only known if one was probed. */
+        s->level = ip_evidence ? 2 : 5;
     else
-        s->level = 3;
+        s->level = port_evidence ? 3 : 5;
     {
-        char message[160];
+        char message[176];
         snprintf(message, sizeof(message),
                  "STUN NAT level: %d (mapping %s, other port %s, other address %s; "
-                 "change-request honoured: port %s, address %s)",
+                 "server honours change-request: port %s, address %s)",
                  s->level, s->mapped_same ? "stable" : "per-destination",
                  s->port_changed ? "answered" : "filtered",
-                 s->ip_changed ? "answered" : "filtered",
-                 s->port_supported ? "yes" : "no", s->ip_supported ? "yes" : "no");
+                 s->ip_changed ? "answered" : "filtered", port_evidence ? "yes" : "unknown",
+                 ip_evidence ? "yes" : "unknown");
         emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, message);
     }
     if (c->ws && c->login_ok)
@@ -4121,6 +4131,13 @@ static void nat_stun_step(fastp2p_client *c, uint64_t now) {
         if (received > 0) {
             fp_stun_mapped mapped;
             if (fp_stun_response(data, (size_t)received, s->tid, &mapped) && mapped.valid) {
+                if (mapped.has_alternate) {
+                    /* The server told us where it would answer from, which is a
+                     * declaration that change-ip is implemented - so a missing
+                     * reply later is our NAT dropping it, not a missing feature. */
+                    s->has_alternate = 1;
+                    s->ip_supported = 1;
+                }
                 if (s->phase == 1) {
                     if (!s->mapped_seen) {
                         op_addr_copy(&s->mapped, &mapped.address);

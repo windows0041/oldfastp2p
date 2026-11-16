@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """NAT level detection driven by a controllable STUN responder.
 
 A real NAT is not needed here: the responder decides what comes back, which is
@@ -67,23 +67,32 @@ def wait(check, timeout=60, what='condition'):
     raise TimeoutError('timed out waiting for %s (%s)' % (what, error))
 
 
-def response(transaction, mapped_port):
-    """BINDING success with XOR-MAPPED-ADDRESS for 127.0.0.1:mapped_port."""
+def response(transaction, mapped_port, alternate=None):
+    """BINDING success with XOR-MAPPED-ADDRESS and, when the responder stands in
+    for an RFC 5780 server, OTHER-ADDRESS naming the change-ip source."""
     xport = mapped_port ^ (MAGIC >> 16)
     cookie = struct.pack('!I', MAGIC)
     addr = bytes(a ^ b for a, b in zip(socket.inet_aton('127.0.0.1'), cookie))
     value = bytes([0, 1]) + struct.pack('!H', xport) + addr
     attr = struct.pack('!HH', 0x0020, len(value)) + value
-    return struct.pack('!HH', 0x0101, len(attr)) + struct.pack('!I', MAGIC) + transaction + attr
+    if alternate:
+        other = bytes([0, 1]) + struct.pack('!H', alternate[1]) + socket.inet_aton(alternate[0])
+        attr += struct.pack('!HH', 0x802C, len(other)) + other
+    return struct.pack('!HHI', 0x0101, len(attr), MAGIC) + transaction + attr
 
 
 class StunResponder(threading.Thread):
     """One STUN server whose answers stand in for a NAT's filtering behaviour."""
 
-    def __init__(self, mode, port_report=None):
+    def __init__(self, mode, port_report=None, advertise_alternate=True):
         super().__init__(daemon=True)
         self.mode = mode
         self.port_report = port_report
+        # A responder that advertises OTHER-ADDRESS declares it implements
+        # change-ip, so a dropped reply becomes evidence of filtering. The
+        # "silent" flavour advertises nothing and ignores the attribute, which is
+        # what public RFC 5389 servers do - and must not be read as NAT3.
+        self.advertise_alternate = advertise_alternate
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(('127.0.0.1', 0))
         self.port = self.sock.getsockname()[1]
@@ -114,10 +123,12 @@ class StunResponder(threading.Thread):
             change_port = bool(changed & 0x02)
             change_ip = bool(changed & 0x04)
             mapped = self.port_report if self.port_report else peer[1]
-            payload = response(transaction, mapped)
+            alternate = (ALT_IP, self.alt_ip.getsockname()[1]) if self.advertise_alternate else None
+            payload = response(transaction, mapped, alternate)
             if change_ip:
-                # "port" and "addr" flavours model a NAT that drops exactly this.
-                if self.mode in ('port', 'addr'):
+                # A server that does not implement the attribute answers from the
+                # same tuple (or not at all); either way nothing is proven.
+                if not self.advertise_alternate or self.mode in ('port', 'addr'):
                     continue
                 self.alt_ip.sendto(payload, peer)
             elif change_port:
@@ -162,11 +173,14 @@ try:
         jwt = api('/api/v1/user/login',
                   {'user': credentials['FASTP2P_USER'], 'password': password}, False)['token']
 
-        for label, mode, servers, expected in (
-                ('full', 'full', 1, 1),
-                ('addr', 'addr', 1, 2),
-                ('port', 'port', 1, 3),
-                ('sym', 'sym', 2, 4)):
+        for label, mode, servers, expected, advertise in (
+                ('full', 'full', 1, 1, True),
+                ('addr', 'addr', 1, 2, True),
+                ('port', 'port', 1, 3, True),
+                ('sym', 'sym', 2, 4, True),
+                # A public server that ignores CHANGE-REQUEST must not be read as
+                # "port restricted": the level stays undetermined (5 = NAT1/2).
+                ('silent', 'port', 1, 5, False)):
             responders = []
             endpoints = []
             for index in range(servers):
@@ -174,7 +188,7 @@ try:
                 port_report = None
                 if mode == 'sym':
                     port_report = 40000 + index * 7
-                responder = StunResponder(mode, port_report)
+                responder = StunResponder(mode, port_report, advertise)
                 responder.start()
                 responders.append(responder)
                 endpoints.append('127.0.0.1:%d' % responder.port)
@@ -190,12 +204,24 @@ try:
             path.chmod(0o600)
             start([Path(args.c_client).resolve(), '--config', path], name, directory)
 
-            wait(lambda n=name: (node(n) or {}).get('natLevel') in (1, 2, 3, 4),
-                 timeout=60, what=label + ' to publish a level')
-            level = int(node(name)['natLevel'])
+            # Wait for the *verdict line* rather than the stored field: 5 is also
+            # the value before any STUN answer exists, so the field alone cannot
+            # prove the "no evidence, no conclusion" rule fired.
+            def verdict(n=name):
+                text = (logs / (n + '.log')).read_text(errors='replace')
+                marker = 'STUN NAT level: '
+                index = text.rfind(marker)
+                if index < 0:
+                    return None
+                return int(text[index + len(marker)])
+
+            wait(verdict, timeout=60, what=label + ' to reach a STUN verdict')
+            level = verdict()
             print('%s -> NAT%d (expected NAT%d)' % (label, level, expected), flush=True)
             assert level == expected, '%s: expected NAT%d, got NAT%d' % (label, expected, level)
-            results['stun ' + mode] = level
+            wait(lambda n=name, e=expected: (node(n) or {}).get('natLevel') == e,
+                 timeout=30, what=label + ' to publish NAT%d' % expected)
+            results['stun ' + label] = level
 
             for responder in responders:
                 responder.stop()
@@ -215,3 +241,4 @@ finally:
         handle.close()
     (logs / 'result.json').write_text(json.dumps(results, indent=2) + '\n')
     print(json.dumps(results, indent=2))
+

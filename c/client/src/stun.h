@@ -16,6 +16,13 @@
 typedef struct {
     op_addr address;
     int valid;
+    /* RFC 5780 OTHER-ADDRESS: the server's alternate address, which it uses to
+     * answer change-ip requests. A server that advertises one is declaring that
+     * it implements the NAT-behaviour extension, so a missing reply to our
+     * change-ip probe becomes evidence of filtering rather than of an
+     * unsupported attribute. */
+    op_addr alternate;
+    int has_alternate;
 } fp_stun_mapped;
 
 /* Builds a BINDING request. change_ip/change_port set CHANGE-REQUEST so a

@@ -10,6 +10,7 @@
 #define ATTR_MAPPED_ADDRESS 0x0001
 #define ATTR_CHANGE_REQUEST 0x0003
 #define ATTR_XOR_MAPPED_ADDRESS 0x0020
+#define ATTR_OTHER_ADDRESS 0x802C
 
 static void put16(uint8_t *p, uint16_t v) {
     p[0] = (uint8_t)(v >> 8);
@@ -122,6 +123,8 @@ int fp_stun_response(const uint8_t *data, size_t length, const uint8_t transacti
             break;
         if (type == ATTR_MAPPED_ADDRESS && !mapped->valid)
             mapped->valid = decode_address(value, size, 0, &mapped->address) == 0;
+        if (type == ATTR_OTHER_ADDRESS && !mapped->has_alternate)
+            mapped->has_alternate = decode_address(value, size, 0, &mapped->alternate) == 0;
         if (type == ATTR_XOR_MAPPED_ADDRESS && !xored.valid) {
             /* XOR-MAPPED-ADDRESS v4 is the common case; v6 needs the transaction
              * as part of the mask, which decode_address cannot see. */
@@ -138,8 +141,15 @@ int fp_stun_response(const uint8_t *data, size_t length, const uint8_t transacti
         }
         offset += 4 + ((size + 3) & ~(size_t)3);
     }
-    if (xored.valid)
-        *mapped = xored; /* the obfuscated attribute is the authoritative one */
+    if (xored.valid) {
+        /* The obfuscated attribute is authoritative for the mapping, but the
+         * alternate address was parsed separately and must survive. */
+        op_addr alternate = mapped->alternate;
+        int has_alternate = mapped->has_alternate;
+        *mapped = xored;
+        mapped->alternate = alternate;
+        mapped->has_alternate = has_alternate;
+    }
     return mapped->valid;
 }
 
