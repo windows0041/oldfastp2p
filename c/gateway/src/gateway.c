@@ -2525,8 +2525,12 @@ sqlite3_close(g.db);
         goto failed;
     }
     memset(&info, 0, sizeof(info));
+    /* The IPv4 vhosts must not fall back to the IPv6 wildcard. A libwebsockets
+     * built with LWS_IPV6=ON will otherwise bind [::] for an iface of "127.0.0.1"
+     * when V6ONLY is set, and every IPv4 client is refused - which looks like the
+     * gateway never listening at all, while its own "ready" line claims the port. */
     info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT | LWS_SERVER_OPTION_IPV6_V6ONLY_MODIFY |
-                   LWS_SERVER_OPTION_IPV6_V6ONLY_VALUE;
+                   LWS_SERVER_OPTION_IPV6_V6ONLY_VALUE | LWS_SERVER_OPTION_DISABLE_IPV6;
     info.protocols = protocols;
     info.ssl_cert_filepath = g.cert;
     info.ssl_private_key_filepath = g.key;
@@ -2539,6 +2543,10 @@ sqlite3_close(g.db);
     info.port = (int)g.ws_port;
     info.vhost_name = "fastp2p-wss";
     g.ws_vhost = lws_create_vhost(g.context, &info);
+    if (!g.ws_vhost) {
+        fputs("Cannot bind the WSS port\n", stderr);
+        goto failed;
+    }
     g.ws_alt_vhost = NULL;
     if (g.alt_ws_port) {
         info.iface = g.bind;
@@ -2554,10 +2562,16 @@ sqlite3_close(g.db);
     info.port = (int)g.api_port;
     info.vhost_name = "fastp2p-api";
     g.api_vhost = lws_create_vhost(g.context, &info);
+    if (!g.api_vhost) {
+        fputs("Cannot bind the API port\n", stderr);
+        goto failed;
+    }
     /* Independent IPv6 listeners, created only when --bind6 was given: the WSS
-     * vhost first, then the optional alt WSS, then the API vhost. */
+     * vhost first, then the optional alt WSS, then the API vhost. Those vhosts opt
+     * back into IPv6, which the IPv4 ones above deliberately disable. */
     g.ws_vhost6 = g.ws_alt_vhost6 = g.api_vhost6 = NULL;
     if (*g.bind6) {
+        info.options &= ~(uint64_t)LWS_SERVER_OPTION_DISABLE_IPV6;
         info.iface = g.bind6;
         info.port = (int)g.ws_port;
         info.vhost_name = "fastp2p-wss6";
