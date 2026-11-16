@@ -329,7 +329,7 @@ try:
         assert legacy['tcpNatSamples6'] == 0 and legacy['families'] == 1
         assert legacy['isActive'] == 0 and legacy['lastSeen']
         with sqlite3.connect(old_db) as db:
-            assert db.execute('PRAGMA user_version').fetchone()[0] == 7
+            assert db.execute('PRAGMA user_version').fetchone()[0] == 8
             assert db.execute('PRAGMA quick_check').fetchone()[0] == 'ok'
             row = db.execute("SELECT nat6,tcp_nat6,families FROM nodes WHERE name='legacy-node'").fetchone()
             assert row == (314, 314, 1), row

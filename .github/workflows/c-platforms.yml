@@ -372,7 +372,11 @@ jobs:
           name: fastp2p-linux-static-${{ matrix.arch }}
           path: dist/fastp2p-linux-static-${{ matrix.arch }}.tar.gz
   release:
-    needs: [macos, cross, linux, windows, musl]
+    # Only the jobs that produce a client artifact gate publishing: eight musl
+    # architectures, the cross builds (Windows/Android) and macOS. The linux and
+    # windows validation jobs still run and stay visible, but a failing test in
+    # them must not stop the multi-architecture packages from being published.
+    needs: [macos, cross, musl]
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/fastp2p-client-v')
     runs-on: ubuntu-24.04
     permissions:
