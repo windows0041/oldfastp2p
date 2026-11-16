@@ -85,12 +85,7 @@ jobs:
         with:
           name: fastp2p-gateway-docker-amd64
           path: dist/fastp2p-gateway-docker-amd64.tar.gz
-      # The image has already built, run --version and been packaged above. Booting
-      # it under the runner's own UID is a smoke test that has been failing in CI
-      # while the same binary passes the full protocol suite elsewhere, so it stays
-      # visible as a warning instead of withholding the published image.
       - name: Boot with private TLS certificate
-        continue-on-error: true
         run: |
           bash scripts/tls/generate-cert.sh "$RUNNER_TEMP/c-gateway-tls" localhost 127.0.0.1 > "$RUNNER_TEMP/c-gateway-cert.log" 2>&1
           mkdir -p "$RUNNER_TEMP/c-gateway-state"
