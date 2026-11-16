@@ -129,6 +129,9 @@ typedef struct {
     int port_supported, ip_supported;
     int has_alternate; /* some server advertised its alternate address */
     int level; /* 0 = STUN produced no verdict */
+    /* 1 when the server reported exactly the address we sent from, i.e. the path
+     * has no NAT translation and the level describes the host firewall. */
+    int no_nat;
     /* One retransmission per phase: a single lost datagram (common right after
      * startup, while DNS and routing settle) must not throw away the mapping and
      * turn a measurable NAT into "unknown". */
@@ -4070,6 +4073,17 @@ static void nat_stun_send(fastp2p_client *c) {
 }
 static void nat_stun_finish(fastp2p_client *c) {
     nat_stun *s = &c->stun;
+    /* Read the local endpoint before closing: when the server reports exactly the
+     * address we sent from, there is no NAT in the path at all, and calling that
+     * a full-cone NAT would be wrong. */
+    if (s->fd >= 0 && s->mapped_seen && !s->no_nat) {
+        op_addr local;
+        memset(&local, 0, sizeof(local));
+        if (!op_addr_socketname(s->fd, &local) &&
+            op_addr_family(&local) == op_addr_family(&s->mapped) &&
+            op_addr_port(&local) == op_addr_port(&s->mapped) && same_ip(&local, &s->mapped))
+            s->no_nat = 1;
+    }
     if (s->fd >= 0)
         op_close(s->fd);
     s->fd = -1;
@@ -4086,6 +4100,11 @@ static void nat_stun_finish(fastp2p_client *c) {
     int ip_evidence = s->ip_supported || s->has_alternate;
     if (!s->mapped_seen)
         s->level = 0;
+    else if (s->no_nat)
+        /* No translation, so the "levels" describe the host firewall instead:
+         * reachable from elsewhere is an open internet host, and a path that
+         * answers nothing is a symmetric UDP firewall (RFC 3489 §5). */
+        s->level = (s->port_changed || s->ip_changed) ? 6 : (port_evidence ? 7 : 0);
     else if (!s->mapped_same)
         s->level = 4;
     else if (s->ip_changed)
@@ -4243,8 +4262,10 @@ static int nat_level(const fastp2p_client *c) {
         return 0;
     if (n->type != NAT_CONE)
         return 4;
-    /* An external STUN observer settles it without needing a second node. */
-    if (c->stun.level >= 1 && c->stun.level <= 4)
+    /* An external STUN observer settles it without needing a second node. Levels
+     * 6 and 7 mean "no NAT in the path": 6 is an open host, 7 a symmetric UDP
+     * firewall, and both are decided from the local-versus-mapped comparison. */
+    if (c->stun.level >= 1 && c->stun.level <= 7)
         return c->stun.level;
     /* Without a STUN verdict the mapping still proves "cone", but which
      * cone variant it is stays unmeasured rather than guessed. */

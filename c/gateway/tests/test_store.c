@@ -50,7 +50,7 @@ static void migrate_dualstack(void) {
     assert(!gw_store_open(&db,path));
     sqlite3_stmt *statement=NULL;
     assert(!sqlite3_prepare_v2(db,"PRAGMA user_version",-1,&statement,NULL));
-    assert(sqlite3_step(statement)==SQLITE_ROW && sqlite3_column_int(statement,0)==7);
+    assert(sqlite3_step(statement)==SQLITE_ROW && sqlite3_column_int(statement,0)==8);
     sqlite3_finalize(statement);
     json_object *list=gw_store_list(db,"legacy-node",10,0);assert(list);
     json_object *node=json_object_array_get_idx(gw_get(list,"nodes"),0);assert(node);

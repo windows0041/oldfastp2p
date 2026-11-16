@@ -74,6 +74,13 @@ int main(void) {
         levels.stun.level = 1;
         assert(nat_level(&levels) == 4); /* mapping decides; STUN is moot */
     }
+    /* 6 and 7 mean there is no NAT: the mapping is our own address, so the
+     * level describes the host firewall rather than a translation. */
+    levels.nat[OP_FAM_V4].type = NAT_CONE;
+    levels.stun.level = 6;
+    assert(nat_level(&levels) == 6);
+    levels.stun.level = 7;
+    assert(nat_level(&levels) == 7);
     levels.stun.level = 0;
     levels.nat[OP_FAM_V4].type = NAT_CONE;
     assert(nat_level(&levels) == 5); /* STUN unreachable: stay undetermined */

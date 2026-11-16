@@ -13,7 +13,7 @@
    * 5 means the mapping is cone-shaped but no second node was available to test
    * the foreign-source case, so NAT1 and NAT2 cannot be told apart yet. */
   const udpLevel = node =>
-    ({1: 'NAT1', 2: 'NAT2', 3: 'NAT3', 4: 'NAT4', 5: 'NAT1/2'}[Number(node.natLevel)] || '未知');
+    ({1: 'NAT1', 2: 'NAT2', 3: 'NAT3', 4: 'NAT4', 5: 'NAT1/2', 6: '无 NAT', 7: '对称防火墙'}[Number(node.natLevel)] || '未知');
   /* TCP is shown as a mapping observation, never as a NAT level. The probe
    * measures whether the mapping depends on the destination and does not test
    * inbound filtering, so a stable mapping is not full cone: a measured node kept

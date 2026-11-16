@@ -179,7 +179,7 @@ static int nat_fields(struct connection *c, json_object *j) {
         if (!json_object_is_type(level, json_type_int) || json_object_get_int64(level) < 0)
             return -1;
         uint64_t n = json_object_get_uint64(level);
-        if (n > 5)
+        if (n > 7)
             return -1;
         c->nat_level = (unsigned)n;
     }
