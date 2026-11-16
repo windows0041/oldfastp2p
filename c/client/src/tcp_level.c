@@ -188,6 +188,20 @@ static void verdict(fp_tcp_level *state) {
         state->level = 3;
 }
 
+/* One retry with a fresh local port: the port the kernel hands to connect() can be
+ * unusable for the co-located listener (another service may hold it), and that is a
+ * reason to try again rather than to report "no verdict". */
+static void retry_or_finish(fp_tcp_level *state) {
+    fp_tcp_level_close(state);
+    if (state->attempt < 1) {
+        state->attempt++;
+        TRACE("retrying with a fresh port");
+        state->phase = 0;
+        fp_tcp_level_start(state);
+        return;
+    }
+    state->phase = 4;
+}
 static void finish(fp_tcp_level *state) {
     verdict(state);
     TRACE("verdict level=%d answered=%d same_port=%d other_ip=%d accepted=%d", state->level,
@@ -208,8 +222,7 @@ void fp_tcp_level_step(fp_tcp_level *state, uint64_t now) {
         if (ready <= 0) {
             if (now > state->deadline) {
                 TRACE("connect timed out (revents=%d)", item.revents);
-                fp_tcp_level_close(state);
-                state->phase = 4;
+                retry_or_finish(state);
             }
             return;
         }
@@ -217,13 +230,11 @@ void fp_tcp_level_step(fp_tcp_level *state, uint64_t now) {
         op_socklen length = sizeof(error);
         if (op_getsockopt(state->dialer, SOL_SOCKET, SO_ERROR, &error, &length) || error) {
             TRACE("connect error %d", error);
-            fp_tcp_level_close(state);
-            state->phase = 4;
+            retry_or_finish(state);
             return;
         }
         if (listen_here(state)) {
-            fp_tcp_level_close(state);
-            state->phase = 4;
+            retry_or_finish(state);
             return;
         }
         TRACE("connected, listening on %u", (unsigned)state->local_port);
@@ -255,8 +266,7 @@ void fp_tcp_level_step(fp_tcp_level *state, uint64_t now) {
         }
         if (now > state->deadline) {
             TRACE("no greeting, deadline hit");
-            fp_tcp_level_close(state);
-            state->phase = 4;
+            retry_or_finish(state);
         }
         return;
     }

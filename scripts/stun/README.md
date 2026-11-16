@@ -8,15 +8,33 @@
 stun-responder.py [--port 3478] [--address 1.2.3.4 ...] [--verbose]
 ```
 
-| 请求 | 应答来源 |
-|---|---|
-| 普通 BINDING | 同 socket |
-| `CHANGE-REQUEST` 换端口 | `<同 IP>:<端口+1>` |
-| `CHANGE-REQUEST` 换地址 | `<另一块本地地址>:<同端口>` |
+套接字布局与参考实现（[jselbie/stunserver](https://github.com/jselbie/stunserver)）一致，是 **2×2 矩阵**，每个请求由其中一个回应：
 
-响应里同时带 `XOR-MAPPED-ADDRESS` 和 RFC 5780 的 `OTHER-ADDRESS`（0x802C，指向换地址应答的来源）。**这是关键**：客户端据此知道"服务器确实实现了换地址"，于是"没收到回包"才成为"我的 NAT 丢了它"的证据，而不是"服务器不支持该属性"。没有它，判定只能停在"NAT1/2"不猜。
+| 角色 | 地址 / 端口 | 何时使用 |
+|---|---|---|
+| PP | 主地址 / 主端口 | 普通请求 |
+| PA | 主地址 / 备端口（`端口+1`） | `CHANGE-REQUEST` 换端口 |
+| AP | 备地址 / 主端口 | `CHANGE-REQUEST` 换地址 |
+| AA | 备地址 / 备端口 | 换地址 + 换端口 |
+
+响应属性按参考实现的顺序输出（有些客户端写死了这个顺序）：
+
+```
+MAPPED-ADDRESS        0x0001
+RESPONSE-ORIGIN       0x802B
+OTHER-ADDRESS         0x802C
+XOR-MAPPED-ADDRESS    0x0020
+```
+
+`OTHER-ADDRESS` 指向 **AA**（备地址 + 备端口），并且**只有四个套接字全部有效时才发送**——告诉客户端一个无法应答的地址，会让它报出根本不存在的端口受限。
+
+`RESPONSE-PORT`（RFC 5780 §4.5，`0x8032`）也支持：客户端可以让服务器把应答发到**它自己指定的端口**，这是 UDP 过滤探测的第二种手段。
+
+**这是关键**：客户端据此知道"服务器确实实现了换地址"，于是"没收到回包"才成为"我的 NAT 丢了它"的证据，而不是"服务器不支持该属性"。没有它，判定只能停在"NAT1/2"不猜。
 
 只应答格式合法的 BINDING 请求，不回显任意载荷，不能被当作通用 UDP 反射器。
+
+自检（无需外网，起两台回环地址）：`python3 scripts/stun/test-responder.py`——覆盖四个角色、属性顺序、`OTHER-ADDRESS` 的发送条件与 `RESPONSE-PORT` 重定向。
 
 ## `tcp-probe-server.py` — TCP，回调 SYN
 

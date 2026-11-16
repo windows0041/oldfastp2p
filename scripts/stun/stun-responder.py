@@ -1,5 +1,5 @@
-﻿#!/usr/bin/env python3
-"""Minimal STUN server that honours RFC 3489 CHANGE-REQUEST.
+#!/usr/bin/env python3
+"""Minimal STUN server that honours RFC 3489 CHANGE-REQUEST and RFC 5780.
 
 Why this exists: public STUN servers mostly ignore CHANGE-REQUEST, so a NAT's
 inbound filter cannot be measured through them (a filtered reply and an ignored
@@ -8,25 +8,32 @@ the "answer from a different address" case real, which is what separates a
 full-cone NAT (NAT1) from an address-restricted one (NAT2) and a port-restricted
 one (NAT3).
 
-Behaviour:
-  plain                 -> reply from the same socket
-  CHANGE-REQUEST port   -> reply from <same ip>:<port + 1>
-  CHANGE-REQUEST ip     -> reply from <other ip>:<same port>
-  CHANGE-REQUEST ip+port-> reply from <other ip>:<port + 1>
-With a single local address the ip variants simply do not answer, which tells the
-client "not measurable" instead of inventing a verdict.
+The layout follows the reference implementation (jselbie/stunserver): four sockets
+in a 2x2 matrix, and every request is answered by one of them:
+
+    primary   address / primary   port   <- plain requests
+    primary   address / alternate port   <- CHANGE-REQUEST port
+    alternate address / primary   port   <- CHANGE-REQUEST ip
+    alternate address / alternate port   <- CHANGE-REQUEST ip + port
+
+Attributes are emitted in the order the reference implementation uses (MAPPED,
+RESPONSE-ORIGIN, OTHER-ADDRESS, XOR-MAPPED-ADDRESS) because some clients are
+written against that ordering. OTHER-ADDRESS is only advertised when all four
+sockets are real: telling a client about an address that cannot answer would make
+it report a port-restricted NAT that does not exist.
+
+RESPONSE-PORT (RFC 5780 section 4.5) is honoured: a client may ask for the reply to
+be sent to a different port of its own address, which is the other way to probe the
+inbound filter.
 
 Usage: stun-responder.py [--port 3478] [--address 1.2.3.4 ...]
-
-Note for operators: any UDP reflection service can be abused for amplification, so
-this answers only requests that look like BINDING and never echoes arbitrary
-payloads."""
+"""
 import argparse
 import json
 import selectors
-import subprocess
 import socket
 import struct
+import subprocess
 import sys
 
 MAGIC = 0x2112A442
@@ -35,7 +42,9 @@ BINDING_SUCCESS = 0x0101
 ATTR_MAPPED = 0x0001
 ATTR_CHANGE_REQUEST = 0x0003
 ATTR_XOR_MAPPED = 0x0020
+ATTR_RESPONSE_ORIGIN = 0x802B
 ATTR_OTHER_ADDRESS = 0x802C
+ATTR_RESPONSE_PORT = 0x8032
 
 
 def local_addresses():
@@ -69,7 +78,7 @@ def local_addresses():
     return addresses
 
 
-def _address_attribute(kind, address, port, xored):
+def address_attribute(kind, address, port, xored):
     if xored:
         port_value = port ^ (MAGIC >> 16)
         cookie = struct.pack('!I', MAGIC)
@@ -81,29 +90,36 @@ def _address_attribute(kind, address, port, xored):
     return struct.pack('!HH', kind, len(value)) + value
 
 
-def build_response(transaction, address, port, alternate=None):
-    """XOR-MAPPED-ADDRESS, plus RFC 5780 OTHER-ADDRESS when this host has a
-    second address.
+def build_response(transaction, client, origin, other):
+    """MAPPED-ADDRESS, RESPONSE-ORIGIN, OTHER-ADDRESS, XOR-MAPPED-ADDRESS.
 
-    Advertising OTHER-ADDRESS is what lets a client tell "the server can answer
-    from another address but my NAT dropped it" apart from "the server never
-    supported the request". Without that distinction a full-cone NAT is reported
-    as port-restricted."""
-    attrs = _address_attribute(ATTR_XOR_MAPPED, address, port, True)
-    if alternate:
-        attrs += _address_attribute(ATTR_OTHER_ADDRESS, alternate[0], alternate[1], False)
+    `origin` is the endpoint this reply leaves from, `other` the endpoint that would
+    answer a combined change-ip/change-port request (None when the host has no
+    second address, which suppresses the attribute)."""
+    attrs = address_attribute(ATTR_MAPPED, client[0], client[1], False)
+    attrs += address_attribute(ATTR_RESPONSE_ORIGIN, origin[0], origin[1], False)
+    if other:
+        attrs += address_attribute(ATTR_OTHER_ADDRESS, other[0], other[1], False)
+    attrs += address_attribute(ATTR_XOR_MAPPED, client[0], client[1], True)
     return struct.pack('!HHI', BINDING_SUCCESS, len(attrs), MAGIC) + transaction + attrs
 
 
-def parse_change_request(data):
+def parse_attributes(data):
+    """Returns (change_ip, change_port, response_port)."""
+    change_ip = change_port = False
+    response_port = 0
     offset = 20
     while offset + 4 <= len(data):
         atype, alen = struct.unpack('!HH', data[offset:offset + 4])
-        if atype == ATTR_CHANGE_REQUEST and alen == 4 and offset + 8 <= len(data):
-            flags = struct.unpack('!I', data[offset + 4:offset + 8])[0]
-            return bool(flags & 0x04), bool(flags & 0x02)
+        value = data[offset + 4:offset + 4 + alen]
+        if atype == ATTR_CHANGE_REQUEST and alen == 4:
+            flags = struct.unpack('!I', value)[0]
+            change_ip = bool(flags & 0x04)
+            change_port = bool(flags & 0x02)
+        elif atype == ATTR_RESPONSE_PORT and alen == 2:
+            response_port = struct.unpack('!H', value)[0]
         offset += 4 + ((alen + 3) & ~3)
-    return False, False
+    return change_ip, change_port, response_port
 
 
 def main():
@@ -117,21 +133,27 @@ def main():
     if not addresses:
         print('no local IPv4 address found', file=sys.stderr)
         return 1
-    print('serving on %s, udp/%d and udp/%d' % (', '.join(addresses), args.port, args.port + 1))
+    primary, alternate_port = args.port, args.port + 1
+    print('serving on %s, udp/%d and udp/%d' % (', '.join(addresses), primary, alternate_port))
 
     selector = selectors.DefaultSelector()
-    # One socket per (address, port) so a reply can pick its source at will.
+    sockets = {}
     for address in addresses:
-        for port in (args.port, args.port + 1):
+        for port in (primary, alternate_port):
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind((address, port))
-            selector.register(sock, selectors.EVENT_READ, (address, port))
+            selector.register(sock, selectors.EVENT_READ)
+            sockets[(address, port)] = sock
 
-    sockets = {(key.data[0], key.data[1]): key.fileobj for key in selector.get_map().values()}
+    # OTHER-ADDRESS is only advertised when the whole 2x2 matrix exists, matching
+    # the reference implementation: a client told about an address that cannot
+    # answer would report filtering that is not there.
+    complete = len(addresses) > 1
+
     while True:
         for key, _ in selector.select(timeout=60):
-            sock, (address, port) = key.fileobj, key.data
+            sock = key.fileobj
             try:
                 data, peer = sock.recvfrom(2048)
             except OSError:
@@ -142,32 +164,40 @@ def main():
             if struct.unpack('!I', data[4:8])[0] != MAGIC:
                 continue
             transaction = data[8:20]
-            change_ip, change_port = parse_change_request(data)
-            target_ip = address
+            change_ip, change_port, response_port = parse_attributes(data)
+            local = sock.getsockname()
+
+            target_address = local[0]
             if change_ip:
-                others = [a for a in addresses if a != address]
+                others = [a for a in addresses if a != local[0]]
                 if not others:
                     if args.verbose:
                         print('change-ip requested but only one address is bound; not answering')
                     continue
-                target_ip = others[0]
-            target_port = port + 1 if change_port else port
-            out = sockets.get((target_ip, target_port))
+                target_address = others[0]
+            target_port = alternate_port if change_port else primary
+            out = sockets.get((target_address, target_port))
             if out is None:
                 continue
+
+            # RESPONSE-PORT lets the client choose the port the answer arrives on;
+            # it is the second way to probe the inbound filter (RFC 5780 4.5).
+            destination = (peer[0], response_port or peer[1])
+            other = None
+            if complete:
+                other_address = [a for a in addresses if a != target_address]
+                if other_address:
+                    other = (other_address[0], alternate_port)
+            payload = build_response(transaction, peer, (target_address, target_port), other)
             try:
-                others = [a for a in addresses if a != address]
-                alternate = (others[0], target_port) if others else None
-                out.sendto(build_response(transaction, peer[0], peer[1], alternate),
-                            peer)
+                out.sendto(payload, destination)
             except OSError:
                 continue
             if args.verbose:
-                print('%s:%d -> %s:%d (change ip=%s port=%s)' % (
-                    address, port, target_ip, target_port, change_ip, change_port))
+                print('%s:%d -> %s:%d (change ip=%s port=%s response-port=%s)' % (
+                    local[0], local[1], target_address, target_port, change_ip, change_port,
+                    response_port or '-'))
 
 
 if __name__ == '__main__':
     sys.exit(main())
-
-

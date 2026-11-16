@@ -31,6 +31,7 @@ typedef struct {
     int accepted;
     int same_port, other_ip; /* 1 = the server reported that callback succeeded */
     int answered;            /* the server returned a verdict line */
+    int attempt;             /* one retry with a fresh local port */
     int level;
 } fp_tcp_level;
 
