@@ -271,6 +271,11 @@ jobs:
         with:
           name: fastp2p-sdk-linux-x86_64
           path: dist/fastp2p-sdk-linux-x86_64.tar.gz
+      - name: C relay escalation when a punch cannot succeed
+        run: |
+          FASTP2P_C_BUILD_DIR="$PWD/build/c" \
+          FASTP2P_C_GATEWAY_BUILD_DIR="$PWD/build/c-gateway" \
+          bash c/client/scripts/check-escalation.sh
       - name: TCP punching through two filtered NAT routers with UDP blocked
         run: unshare --net python3 c/client/tests/tcp_nat3_integration.py --client build/c/fastp2p --gateway build/c-gateway/fastp2p-gateway --logs build/c/tcp-nat3
       - name: Dual-stack registration, per-family NAT levels and an IPv6 tunnel
@@ -299,11 +304,6 @@ jobs:
           FASTP2P_C_BUILD_DIR="$PWD/build/c" \
           FASTP2P_C_GATEWAY_BUILD_DIR="$PWD/build/c-gateway" \
           bash c/client/scripts/check-relay.sh
-      - name: C relay escalation when a punch cannot succeed
-        run: |
-          FASTP2P_C_BUILD_DIR="$PWD/build/c" \
-          FASTP2P_C_GATEWAY_BUILD_DIR="$PWD/build/c-gateway" \
-          bash c/client/scripts/check-escalation.sh
       - name: C punch with a peer advertising a mapping window
         run: |
           FASTP2P_C_BUILD_DIR="$PWD/build/c" \
