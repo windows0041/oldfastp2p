@@ -269,6 +269,9 @@ jobs:
       - name: NAT level detection with a foreign-source probe between two sites
         run: |
           unshare --net sh -c 'ip link set lo up && python3 c/client/tests/natlevel_integration.py --gateway build/c-gateway/fastp2p-gateway --c-client build/c/fastp2p --cert-dir build/dualstack-certs --logs build/c/natlevel'
+      - name: TCP NAT level detection against a local probe server
+        run: |
+          unshare --net sh -c 'ip link set lo up && python3 c/client/tests/tcplevel_integration.py --gateway build/c-gateway/fastp2p-gateway --c-client build/c/fastp2p --cert-dir build/dualstack-certs --logs build/c/tcplevel'
       - name: C SOCKS5, QUIC and token enrollment
         run: |
           bash c/client/scripts/check-socks.sh

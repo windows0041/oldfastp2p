@@ -276,6 +276,7 @@ struct fastp2p_client {
     int stun_count;
     nat_stun stun;
     fp_tcp_level tcp_level;
+    int tcp_level_reported; /* the TCP verdict was already announced */
     /* 1 once every family we decided to probe has finished (or timed out), so
      * the login goes out with a complete picture rather than half-way. */
     int nat_settled;
@@ -4673,10 +4674,21 @@ int fastp2p_client_step(fastp2p_client *c, unsigned wait_ms) {
     /* TCP filtering probe: same window, verdict arrives asynchronously. */
     if (c->tcp_level.phase == 0 && c->tcp_level.server.len && c->ws && c->login_ok)
         fp_tcp_level_start(&c->tcp_level);
-    int tcp_before = c->tcp_level.level;
     fp_tcp_level_step(&c->tcp_level, now);
-    if (c->tcp_level.level != tcp_before && c->ws && c->login_ok)
-        report_nat(c);
+    /* Announce the outcome once, including "no verdict": the console has to be
+     * able to tell a measured level from a probe that simply got no answer, and
+     * a silent probe looks identical to one that has not run yet. */
+    if (c->tcp_level.phase >= 4 && !c->tcp_level_reported) {
+        char message[128];
+        snprintf(message, sizeof(message),
+                 "TCP NAT level: %d (callbacks accepted=%d same-port=%d other-ip=%d)",
+                 c->tcp_level.level, c->tcp_level.accepted, c->tcp_level.same_port,
+                 c->tcp_level.other_ip);
+        emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, message);
+        c->tcp_level_reported = 1;
+        if (c->ws && c->login_ok)
+            report_nat(c);
+    }
     tick_accept(c, now);
     for (int i = 0; i < NT; ++i)
         tick_tunnel(c, i, now);
