@@ -338,6 +338,7 @@ static void bind_pending_key(fastp2p_client *, int);
 static void relay_join(fastp2p_client *, int);
 static void session_ready(fastp2p_client *, int);
 static void probe_complete(fastp2p_client *, int);
+static int tcp_punch_listen(fastp2p_client *, int);
 static void report_client(fastp2p_client *);
 static void report_nat(fastp2p_client *);
 static void tick_nat(fastp2p_client *, uint64_t);
@@ -1429,6 +1430,12 @@ static int probe_round(fastp2p_client *c, int index, uint64_t now) {
 }
 static void probe_complete(fastp2p_client *c, int index) {
     tunnel *t = &c->tunnels[index];
+    /* Listen on the port this client is about to advertise. The TCP punch used to
+     * create the listener lazily, only after a dial failed, so for a short window
+     * the published endpoint - exactly what a LAN peer dials - had nothing behind
+     * it, and the two ends ended up chasing different ports. */
+    if (t->transport == FASTP2P_TRANSPORT_TCP && tcp_punch_listen(c, index))
+        return;
     json_object *j = json_object_new_object();
     op_js(j, "from", c->node);
     /* On a LAN punch the peers exchange private addresses and local ports; the
