@@ -69,6 +69,14 @@ def wait(check, timeout=10):
         time.sleep(.05)
     raise TimeoutError('Dual-stack integration step timed out')
 
+def healthy():
+    """A non-200 is a real answer, so surface the status instead of timing out."""
+    status, body = api('/healthz')
+    if status != 200:
+        raise SystemExit('gateway /healthz answered %s: %s' % (status, body))
+    return True
+
+
 class WS:
     """Minimal fastp2p2 WSS fixture bound to one family's loopback."""
     def __init__(self, name, family=4, port=27183, extra='', credential=None, expected=101):
@@ -147,7 +155,7 @@ try:
             '--cert', str(certs / 'server.crt'), '--key', str(certs / 'server.key'),
             '--bind', '127.0.0.1', '--bind6', '::1', '--public-host', '2001:db8::55'],
             cwd=directory, env=env, stdout=output, stderr=subprocess.STDOUT)
-        wait(lambda: api('/healthz')[0] == 200)
+        wait(healthy, timeout=30)
         # The IPv6 API listener is an independent socket on the same port.
         assert api('/healthz', host='::1')[0] == 200
         status, login = api('/api/v1/user/login', {'user': user, 'password': password})
@@ -316,7 +324,7 @@ try:
             '--cert', str(certs / 'server.crt'), '--key', str(certs / 'server.key'),
             '--database', str(old_db), '--bind', '127.0.0.1'],
             cwd=directory, env=env, stdout=output, stderr=subprocess.STDOUT)
-        wait(lambda: api('/healthz')[0] == 200)
+        wait(healthy, timeout=30)
         status, login = api('/api/v1/user/login', {'user': user, 'password': password})
         if status != 200:  # the legacy database has no stored account row yet
             status, login = api('/api/v1/user/login', {'user': user, 'password': password})

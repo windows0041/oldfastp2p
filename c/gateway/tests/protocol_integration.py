@@ -61,15 +61,31 @@ def api(path, body=None, jwt=None, connection=None, timeout=3):
     finally:
         if connection is None: conn.close()
 
-def wait(check, timeout=10):
+def wait(check, timeout=10, what='protocol integration step'):
+    """Poll until `check` is satisfied, reporting what the last attempt saw.
+
+    A bare timeout hid the difference between "connection refused" and "answered
+    503", which is exactly the distinction needed to debug a CI-only failure."""
     deadline = time.monotonic()+timeout
+    last = 'never evaluated'
     while time.monotonic()<deadline:
         assert process.poll() is None,'Gateway exited; inspect the private log'
         try:
-            if check(): return
-        except (OSError,ValueError): pass
+            result = check()
+            if result: return result
+            last = 'returned %r' % (result,)
+        except (OSError,ValueError) as error:
+            last = '%s: %s' % (type(error).__name__, error)
         time.sleep(.05)
-    raise TimeoutError('Protocol integration step timed out')
+    raise TimeoutError('%s timed out after %ss; last attempt %s' % (what, timeout, last))
+
+def healthy():
+    """The API answers /healthz with 200 once it is serving; anything else is a
+    real answer and must not be mistaken for a slow start."""
+    status, body = api('/healthz')
+    if status != 200:
+        raise SystemExit('gateway /healthz answered %s: %s' % (status, body))
+    return True
 
 class WS:
     def __init__(self,name,credential=token,source='127.0.0.1',port=27183,path='/api/v1/login',expected=101,device=None,hostname=None):
@@ -155,7 +171,7 @@ try:
         env=os.environ.copy();env.update(FASTP2P_USER=user,FASTP2P_PASSWORD=password,FASTP2P_TOKEN=str(token))
         process=subprocess.Popen([str(Path(args.gateway).resolve()),'--cert',str(certs/'server.crt'),'--key',str(certs/'server.key'),
             '--bind','127.0.0.1'],cwd=directory,env=env,stdout=output,stderr=subprocess.STDOUT)
-        wait(lambda:api('/healthz')[0]==200)
+        wait(healthy, timeout=30, what='gateway healthz')
         assert api('/api/v1/devices')[0]==401
         assert api('/api/v1/user/login',{'user':user,'password':'incorrect'})[0]==401
         assert api('/api/v1/user/login',{'user':user,'password':password+'\0suffix'})[0]==401
@@ -333,7 +349,7 @@ try:
         process.terminate();process.wait(timeout=6);assert process.returncode==0
         process=subprocess.Popen([str(Path(args.gateway).resolve()),'--cert',str(certs/'server.crt'),'--key',str(certs/'server.key'),
             '--bind','127.0.0.1','--max-clients','2','--heartbeat-timeout','5'],cwd=directory,env=env,stdout=output,stderr=subprocess.STDOUT)
-        wait(lambda:api('/healthz')[0]==200)
+        wait(healthy, timeout=30, what='gateway healthz')
         rows=api('/api/v1/nodes?search=fixture-host',jwt=jwt)[1]
         assert rows['total']==2 and all(not n['isActive'] for n in rows['nodes'])
         results['SQLite_records_survive_gateway_restart_without_false_online_state']=True
