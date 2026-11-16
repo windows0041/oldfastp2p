@@ -230,6 +230,13 @@ int op_getsockname(op_socket fd, struct sockaddr *address, op_socklen *length) {
     return getsockname((int)fd, address, length);
 #endif
 }
+int op_getpeername(op_socket fd, struct sockaddr *address, op_socklen *length) {
+#ifdef _WIN32
+    return getpeername((SOCKET)fd, address, length) ? socket_error() : 0;
+#else
+    return getpeername((int)fd, address, length);
+#endif
+}
 int op_setsockopt(op_socket fd, int level, int option, const void *value, op_socklen length) {
 #ifdef _WIN32
     return setsockopt((SOCKET)fd, level, option, (const char *)value, length) ? socket_error() : 0;
@@ -288,6 +295,164 @@ int op_address_equal(const struct sockaddr *a, op_socklen alen, const struct soc
     }
     return 0;
 }
+int op_family_index(int family) {
+    if (family == AF_INET)
+        return OP_FAM_V4;
+    if (family == AF_INET6)
+        return OP_FAM_V6;
+    return -1;
+}
+int op_index_family(int index) {
+    return index == OP_FAM_V4 ? AF_INET : index == OP_FAM_V6 ? AF_INET6 : AF_UNSPEC;
+}
+int op_addr_from_text(op_addr *out, const char *text, uint16_t port) {
+    if (!out || !text || !*text)
+        return -1;
+    memset(out, 0, sizeof(*out));
+    if (inet_pton(AF_INET, text, &out->u.in.sin_addr) == 1) {
+        out->u.in.sin_family = AF_INET;
+        out->u.in.sin_port = htons(port);
+        out->len = (op_socklen)sizeof(out->u.in);
+        return 0;
+    }
+    if (inet_pton(AF_INET6, text, &out->u.in6.sin6_addr) == 1) {
+        out->u.in6.sin6_family = AF_INET6;
+        out->u.in6.sin6_port = htons(port);
+        out->len = (op_socklen)sizeof(out->u.in6);
+        /* An IPv4-mapped literal carries no scope; normalize keeps both views
+         * of the same endpoint comparing equal. */
+        return 0;
+    }
+    return -1;
+}
+int op_addr_text(const op_addr *a, char *out, size_t capacity) {
+    if (!a || !out || capacity < 5)
+        return -1;
+    if (a->u.sa.sa_family == AF_INET && a->len >= (op_socklen)sizeof(a->u.in))
+        return inet_ntop(AF_INET, &a->u.in.sin_addr, out, (op_socklen)capacity) ? 0 : -1;
+    if (a->u.sa.sa_family == AF_INET6 && a->len >= (op_socklen)sizeof(a->u.in6))
+        return inet_ntop(AF_INET6, &a->u.in6.sin6_addr, out, (op_socklen)capacity) ? 0 : -1;
+    return -1;
+}
+int op_addr_family(const op_addr *a) { return a ? a->u.sa.sa_family : AF_UNSPEC; }
+uint16_t op_addr_port(const op_addr *a) {
+    if (!a)
+        return 0;
+    if (a->u.sa.sa_family == AF_INET)
+        return ntohs(a->u.in.sin_port);
+    if (a->u.sa.sa_family == AF_INET6)
+        return ntohs(a->u.in6.sin6_port);
+    return 0;
+}
+void op_addr_set_port(op_addr *a, uint16_t port) {
+    if (!a)
+        return;
+    if (a->u.sa.sa_family == AF_INET)
+        a->u.in.sin_port = htons(port);
+    else if (a->u.sa.sa_family == AF_INET6)
+        a->u.in6.sin6_port = htons(port);
+}
+void op_addr_copy(op_addr *dst, const op_addr *src) {
+    if (dst && src)
+        *dst = *src;
+}
+void op_addr_normalize(op_addr *a) {
+    if (!a || a->u.sa.sa_family != AF_INET6 || a->len < (op_socklen)sizeof(a->u.in6))
+        return;
+    const uint8_t *bytes = a->u.in6.sin6_addr.s6_addr;
+    int mapped = 1;
+    for (int i = 0; i < 10; ++i)
+        if (bytes[i])
+            mapped = 0;
+    if (!mapped || bytes[10] != 0xff || bytes[11] != 0xff)
+        return; /* only ::ffff/a.b.c.d collapses; ::1 and others never match */
+    uint8_t v4[4] = {bytes[12], bytes[13], bytes[14], bytes[15]};
+    uint16_t port = a->u.in6.sin6_port; /* network order; preserved as-is */
+    memset(a, 0, sizeof(*a));
+    a->u.in.sin_family = AF_INET;
+    memcpy(&a->u.in.sin_addr, v4, sizeof(v4));
+    a->u.in.sin_port = port;
+    a->len = (op_socklen)sizeof(a->u.in);
+}
+int op_addr_equal(const op_addr *a, const op_addr *b) {
+    if (!a || !b)
+        return 0;
+    op_addr x = *a, y = *b;
+    op_addr_normalize(&x);
+    op_addr_normalize(&y);
+    if (x.u.sa.sa_family != y.u.sa.sa_family)
+        return 0;
+    if (x.u.sa.sa_family == AF_INET)
+        return x.u.in.sin_addr.s_addr == y.u.in.sin_addr.s_addr;
+    if (x.u.sa.sa_family == AF_INET6)
+        return !memcmp(&x.u.in6.sin6_addr, &y.u.in6.sin6_addr, sizeof(x.u.in6.sin6_addr)) &&
+               x.u.in6.sin6_scope_id == y.u.in6.sin6_scope_id;
+    return 0;
+}
+int op_addr_routable(const op_addr *a) {
+    if (!a)
+        return 0;
+    op_addr x = *a;
+    op_addr_normalize(&x);
+    if (x.u.sa.sa_family == AF_INET) {
+        uint32_t v = ntohl(x.u.in.sin_addr.s_addr);
+        /* Reject 0/8, loopback, link-local 169.254/16, site ranges and
+         * multicast/reserved; CGNAT 100.64/10 stays routable because a
+         * carrier peer behind it is still reachable through its mapping. */
+        if (op_addr_private(&x))
+            return 0;
+        if (v < 0x01000000u)
+            return 0;
+        if ((v & 0xFF000000u) == 0x7F000000u)
+            return 0;
+        if ((v & 0xFFFF0000u) == 0xA9FE0000u)
+            return 0;
+        if ((v >> 28) >= 0xEu)
+            return 0;
+        return 1;
+    }
+    if (x.u.sa.sa_family == AF_INET6) {
+        const uint8_t *b = x.u.in6.sin6_addr.s6_addr;
+        static const uint8_t zero[15] = {0};
+        if (!memcmp(b, zero, sizeof(zero)))
+            return 0; /* :: and ::1 are not globally reachable */
+        if (b[0] == 0xFE && (b[1] & 0xC0) == 0x80)
+            return 0; /* fe80::/10 link-local */
+        return (b[0] & 0x2Fu) == 0x20u; /* 2000::/3 global unicast */
+    }
+    return 0;
+}
+int op_addr_private(const op_addr *a) {
+    if (!a)
+        return 0;
+    op_addr x = *a;
+    op_addr_normalize(&x);
+    if (x.u.sa.sa_family == AF_INET) {
+        uint32_t v = ntohl(x.u.in.sin_addr.s_addr);
+        return (v & 0xFF000000u) == 0x0A000000u || (v & 0xFFF00000u) == 0xAC100000u ||
+               (v & 0xFFFF0000u) == 0xC0A80000u;
+    }
+    if (x.u.sa.sa_family == AF_INET6) {
+        const uint8_t *b = x.u.in6.sin6_addr.s6_addr;
+        return (b[0] & 0xFE) == 0xFC /* fc00::/7 ULA */ || b[0] == 0xFE && (b[1] & 0xC0) == 0x80;
+    }
+    return 0;
+}
+static int op_addr_socket(op_socket fd, int peer, op_addr *out) {
+    if (!out)
+        return -1;
+    memset(out, 0, sizeof(*out));
+    out->len = (op_socklen)sizeof(out->u.storage);
+    int rv = peer ? op_getpeername(fd, &out->u.sa, &out->len)
+                  : op_getsockname(fd, &out->u.sa, &out->len);
+    if (rv || (out->len < (op_socklen)sizeof(struct sockaddr)) ||
+        (op_family_index(out->u.sa.sa_family) < 0))
+        return -1;
+    op_addr_normalize(out);
+    return 0;
+}
+int op_addr_socketname(op_socket fd, op_addr *out) { return op_addr_socket(fd, 0, out); }
+int op_addr_peername(op_socket fd, op_addr *out) { return op_addr_socket(fd, 1, out); }
 int op_poll(op_pollfd *fds, unsigned count, int timeout) {
 #ifdef _WIN32
     if (!count) {

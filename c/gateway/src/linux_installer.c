@@ -1,6 +1,7 @@
 #include "linux_installer.h"
 #include "linux_installer_assets.h"
 #include "enrollment.h"
+#include "protocol.h"
 #include <fcntl.h>
 #include <inttypes.h>
 #include <openssl/evp.h>
@@ -59,7 +60,10 @@ static int cached_valid(const char *path,const char *script,size_t length) {
 }
 int gw_linux_installer(const char *directory,const char *host,unsigned port,const char *ca,
                        const struct gw_linux_package *packages,size_t count,char path[700]) {
-    if(!fastp2p_enrollment_host_valid(host) || !port || port>65535 || !ca ||
+    /* A public host may be an IPv6 literal; the URL needs it bracketed. */
+    char authority[300];
+    gw_host_url_authority(authority,sizeof(authority),host);
+    if((!fastp2p_enrollment_host_valid(host) && !gw_is_ipv6_literal(host)) || !port || port>65535 || !ca ||
        strstr(ca,"FASTP2P_DOWNLOAD_CA_EOF") || !count || count>GW_LINUX_ARCH_COUNT)return -1;
     for(size_t i=0;i<count;i++)if(!package_valid(packages+i))return -1;
     const char controller[]="@@FASTP2P_CONTROLLER@@\n",download[]="@@FASTP2P_DOWNLOAD@@\n";
@@ -71,7 +75,7 @@ int gw_linux_installer(const char *directory,const char *host,unsigned port,cons
     fputs("cat > \"$work/fastp2p-service\" <<'FASTP2P_SERVICE_EOF'\n",memory);
     fputs(linux_service_script,memory);fputs("\nFASTP2P_SERVICE_EOF\n",memory);
     a+=sizeof(controller)-1;fwrite(a,1,(size_t)(b-a),memory);
-    fprintf(memory,"gateway_url='https://%s:%u'\ndownload_ca=%u\ncase \"$arch\" in\n",host,port,*ca?1:0);
+    fprintf(memory,"gateway_url='https://%s:%u'\ndownload_ca=%u\ncase \"$arch\" in\n",authority,port,*ca?1:0);
     for(size_t i=0;i<count;i++){
         const struct gw_linux_package *p=packages+i;
         fprintf(memory,"    %s) package_platform='%s'; expected_version='%s'; expected_sha='%s'; expected_size=%" PRIu64 " ;;\n",

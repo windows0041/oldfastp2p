@@ -89,7 +89,7 @@ if [[ ! -f $prefix/lib/libwebsockets.a ]]; then
     -DLWS_WITH_MINIMAL_EXAMPLES=OFF -DLWS_WITHOUT_DAEMONIZE=ON -DLWS_WITH_SQLITE3=OFF \
     -DLWS_WITH_PLUGINS=OFF -DLWS_WITHOUT_EXTENSIONS=ON -DLWS_WITH_HTTP2=OFF \
     -DLWS_WITH_ZLIB=OFF -DLWS_WITH_LIBUV=OFF -DLWS_WITH_LIBEV=OFF \
-    -DLWS_WITH_EVLIB_PLUGINS=OFF -DLWS_IPV6=OFF >/dev/null
+    -DLWS_WITH_EVLIB_PLUGINS=OFF -DLWS_IPV6=ON >/dev/null
   cmake --build "$work/build-lws-$arch" --parallel "$jobs" >/dev/null
   cmake --install "$work/build-lws-$arch" >/dev/null
 fi

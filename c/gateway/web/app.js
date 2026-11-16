@@ -7,7 +7,19 @@
   /* The console keeps its session in sessionStorage: it survives a reload, but
    * it dies with the tab and is never shared with another tab. */
   const STORE = 'fastp2p.console';
-  const mapping = value => ({1: '映射稳定', 2: '目标相关', 3: '递增映射', 4: '递减映射'}[Number(value)] || '未知');
+  /* UDP NAT level, as measured: the mapping test says cone or symmetric, then two
+   * filtering probes (an answer from another gateway port, and one from another
+   * node's address) separate full cone / address-restricted / port-restricted.
+   * 5 means the mapping is cone-shaped but no second node was available to test
+   * the foreign-source case, so NAT1 and NAT2 cannot be told apart yet. */
+  const udpLevel = node =>
+    ({1: 'NAT1', 2: 'NAT2', 3: 'NAT3', 4: 'NAT4', 5: 'NAT1/2'}[Number(node.natLevel)] || '未知');
+  /* TCP keeps the mapping-only wording: the TCP probe measures mapping stability
+   * and never sends a filtering probe, so it cannot distinguish NAT2/NAT3. */
+  const tcpLevel = value => ({1: 'NAT1', 2: 'NAT4'}[Number(value)] || '未知');
+  const natDetail = value =>
+    ({1: '映射与目标无关', 2: '对称（端口随机）', 3: '对称（端口递增）', 4: '对称（端口递减）'}[Number(value)] || '探测未完成');
+  const hasFamily = (node, bit) => (Number(node.families) || 1) & bit;
   function persist() {
     try {
       if (state.token)
@@ -81,7 +93,7 @@
   }
   function renderNodes() {
     const query = $('node-search').value.toLowerCase().trim();
-    const nodes = state.nodes.filter(n => [n.name, n.hostname, n.ip, n.lanip, n.os].some(v => String(v || '').toLowerCase().includes(query)));
+    const nodes = state.nodes.filter(n => [n.name, n.hostname, n.ip, n.ipv6, n.lanip, n.os].some(v => String(v || '').toLowerCase().includes(query)));
     $('nodes').replaceChildren();
     for (const n of nodes) {
       const row = element('tr'); row.classList.toggle('selected', n.name === state.selected?.name);
@@ -89,12 +101,26 @@
       info.append(element('span', 'node-avatar', String(n.os).endsWith('-c') ? 'C' : '◇'));
       label.append(element('span', 'node-title', n.name), element('span', 'node-subtitle', n.os || '未知系统'));
       if (n.hostname) label.append(element('span', 'node-subtitle', '主机：' + n.hostname));
+      /* SPEC §1: the family badge tells the operator what this node can reach. */
+      const v4 = hasFamily(n, 1), v6 = hasFamily(n, 2);
+      label.append(element('span', 'node-subtitle', '协议族：' + (v4 && v6 ? 'IPv4 + IPv6' : v6 ? '仅 IPv6' : '仅 IPv4')));
       info.append(label); cell.append(info); row.append(cell);
-      for (const value of [n.ip || '—', n.lanip || '—']) row.append(element('td', 'mono', value));
+      const public_cell = element('td', 'mono');
+      public_cell.append(document.createTextNode(n.ip || '—'));
+      if (n.ipv6) public_cell.append(element('small', 'mono node-subtitle', n.ipv6));
+      row.append(public_cell, element('td', 'mono', n.lanip || '—'));
       const nat = element('td');
-      nat.append(element('span', '', 'UDP：' + mapping(n.udpNatType ?? n.natType)),
-        element('small', 'node-subtitle', 'TCP：' + mapping(n.tcpNatType)));
-      nat.title = `TCP：${Number(n.tcpNatSamples) || 0} 个样本，${Number(n.tcpNatDestinationIPs) || 0} 个目标 IP。仅检测映射，未检测入站过滤；映射稳定不等于任意来源可访问。`;
+      /* Only IPv4 is shown: with IPv6 there is normally no NAT to classify, so a
+       * second pair of levels would be noise rather than information. */
+      nat.append(element('span', '', 'UDP：' + udpLevel(n)),
+        element('small', 'node-subtitle', 'TCP：' + tcpLevel(n.tcpNatType)));
+      nat.title = 'UDP ' + udpLevel(n) +
+        '：NAT1 全锥／NAT2 地址受限／NAT3 端口受限／NAT4 对称。' +
+        '（映射观测：' + natDetail(n.udpNatType) + '；探测端口 ' + (Number(n.publicIPPort) || 0) + '）' +
+        'TCP ' + tcpLevel(n.tcpNatType) + '：只测映射稳定性（' +
+        (Number(n.tcpNatSamples) || 0) + ' 个样本，' + (Number(n.tcpNatDestinationIPs) || 0) +
+        ' 个目标 IP），未做入站过滤探测。' +
+        (Number(n.natLevel) === 5 ? ' NAT1/2 表示映射为锥形，但当时没有第二个节点可用于区分是否接受陌生来源。' : '');
       row.append(nat, element('td', 'mono', n.version || '—'));
       const active = Number(n.isActive) === 1;
       const status = element('td'); status.append(element('span', 'badge ' + (active ? 'online' : 'offline'), active ? '● 在线' : '○ 离线')); row.append(status);
@@ -102,12 +128,6 @@
       button.type = 'button'; button.setAttribute('aria-label', '查看 ' + n.name + ' 的规则');
       button.addEventListener('click', event => { event.stopPropagation(); selectNode(n); });
       action.append(button);
-      if (n.capabilities?.configPush || (!active && String(n.os).endsWith('-c') && !String(n.os).startsWith('android') && compareVersions(n.version, '2.0.4') >= 0)) {
-        const config = element('button', 'link-button', '配置'); config.type = 'button';
-        config.setAttribute('aria-label', '配置节点 ' + n.name);
-        config.addEventListener('click', event => { event.stopPropagation(); openConfig(n); });
-        action.append(config);
-      }
       const latest = latestFor(platformForOs(n.os));
       if (active && latest && compareVersions(n.version, latest) < 0) {
         const upgrade = element('button', 'link-button', '升级到 ' + latest); upgrade.type = 'button';
@@ -350,48 +370,6 @@
       text('update-message', error.message);
     } finally { button.disabled = false; }
   }
-  let configNode = null, configTimer;
-  const configLabels = {none: '尚未下发配置。', queued: '已保存到网关，等待客户端上线接收。',
-    saved: '客户端已保存配置，正在重载并验证连接…', applied: '客户端已确认配置生效。',
-    failed: '客户端未能应用此配置。旧配置已保留；请检查字段或客户端日志后重新下发。'};
-  async function openConfig(node) {
-    clearTimeout(configTimer); configNode = node.name;
-    text('config-title', node.name + ' · 配置'); $('config-error').hidden = true;
-    $('save-config').disabled = true; $('config-fields').value = '{}';
-    text('config-status', '正在读取网关配置…'); $('config-dialog').showModal();
-    try {
-      const result = await api('/api/v1/device/' + encodeURIComponent(node.name) + '/config');
-      if (configNode !== node.name || !$('config-dialog').open) return;
-      $('config-fields').value = JSON.stringify(result.fields, null, 2);
-      text('config-status', configLabels[result.state] || '');
-    } catch (error) { $('config-error').hidden = false; text('config-error', error.message); }
-    finally { $('save-config').disabled = false; }
-  }
-  async function pollConfig(node, revision, until) {
-    if (!state.token || configNode !== node || !$('config-dialog').open) return;
-    try {
-      const result = await api('/api/v1/device/' + encodeURIComponent(node) + '/config');
-      if (configNode !== node || !$('config-dialog').open) return;
-      text('config-status', configLabels[result.state] || '');
-      if (result.revision >= revision && ['applied', 'failed'].includes(result.state)) return;
-      if (Date.now() < until) configTimer = setTimeout(() => pollConfig(node, revision, until), 1500);
-      else text('config-status', '仍在等待客户端确认；可稍后重新打开配置查看状态。');
-    } catch (error) { $('config-error').hidden = false; text('config-error', error.message); }
-  }
-  $('close-config').addEventListener('click', () => $('config-dialog').close());
-  $('config-dialog').addEventListener('close', () => { clearTimeout(configTimer); configNode = null; $('config-fields').value = ''; });
-  $('config-form').addEventListener('submit', async event => {
-    event.preventDefault(); $('config-error').hidden = true; $('save-config').disabled = true;
-    const node = configNode;
-    try {
-      const fields = JSON.parse($('config-fields').value);
-      if (!fields || Array.isArray(fields) || typeof fields !== 'object') throw new Error('请填写 JSON 对象。');
-      const result = await api('/api/v1/device/' + encodeURIComponent(node) + '/config', {fields});
-      text('config-status', configLabels[result.state] || '配置已排队。');
-      clearTimeout(configTimer); pollConfig(node, result.revision, Date.now() + 120000);
-    } catch (error) { $('config-error').hidden = false; text('config-error', error.message); }
-    finally { $('save-config').disabled = false; }
-  });
   let syncTimer;
   async function syncRelease(start = false) {
     const token = state.token;
@@ -474,7 +452,8 @@
     relay.firstChild.value = '';
     for (const n of state.nodes) {
       if (n.name === state.selected.name) continue;
-      const option = element('option', null, `${n.name}（UDP：${mapping(n.udpNatType ?? n.natType)} / TCP：${mapping(n.tcpNatType)}）`);
+      const option = element('option', null,
+        `${n.name}（UDP：${udpLevel(n)} / TCP：${tcpLevel(n.tcpNatType)}）`);
       option.value = n.name; relay.append(option);
     }
     relay.value = app?.relayNode || '';

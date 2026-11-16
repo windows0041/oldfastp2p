@@ -25,6 +25,11 @@ const char *gw_string(json_object *j, const char *name);
 uint64_t gw_integer(json_object *j, const char *name);
 void gw_js(json_object *j, const char *name, const char *text);
 void gw_ju(json_object *j, const char *name, uint64_t value);
+/* DUALSTACK-SPEC §3/§7: an IPv6 address literal inside a URL authority must be
+ * bracketed; a hostname or IPv4 text is copied unchanged. gw_is_ipv6_literal
+ * reports whether text parses as an IPv6 address (no brackets, no %scope). */
+int gw_is_ipv6_literal(const char *text);
+void gw_host_url_authority(char *out, size_t capacity, const char *host);
 uint64_t gw_totp(uint64_t token, uint64_t timestamp);
 int gw_token_valid(uint64_t code, uint64_t token, uint64_t timestamp);
 char *gw_jwt_issue(const char *user, uint64_t token, const char *secret, uint64_t now);

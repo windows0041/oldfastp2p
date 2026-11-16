@@ -7,11 +7,12 @@ static op_socket bound_port(uint16_t *port) {
     op_socket fd=socket_bound(0,"127.0.0.1",0,1);assert(fd>=0);*port=socket_port(fd);assert(*port);return fd;
 }
 static void tcp_retry(void) {
-    fastp2p_client *c=calloc(1,sizeof(*c));assert(c);strcpy(c->local_ip,"127.0.0.1");
+    fastp2p_client *c=calloc(1,sizeof(*c));assert(c);strcpy(c->local_ip[OP_FAM_V4],"127.0.0.1");
     uint16_t remote,local;op_socket endpoint=bound_port(&remote),reserve=bound_port(&local);op_close(reserve);
     int ti=new_tunnel(c,"retry-target",100,FASTP2P_TRANSPORT_TCP,0);assert(ti>=0);
     tunnel *t=&c->tunnels[ti];strcpy(t->ip,"127.0.0.1");strcpy(t->mode,"tcppunch");
     t->local_port=local;t->remote_port=remote;t->tcp_v2=1;t->server=1;
+    assert(!op_addr_from_text(&t->peer_addr,"127.0.0.1",remote));
     /* BSD may leave the first connect pending until the production 3-second
      * attempt deadline instead of reporting an immediate loopback refusal. */
     start_underlay(c,ti);uint64_t until=mono()+12*NS;int listening=0;
@@ -28,6 +29,7 @@ static void tcp_retry(void) {
     endpoint=bound_port(&remote);reserve=bound_port(&local);op_close(reserve);
     ti=new_tunnel(c,"fallback-peer",101,FASTP2P_TRANSPORT_TCP,1);assert(ti>=0);t=&c->tunnels[ti];
     strcpy(t->ip,"127.0.0.1");strcpy(t->mode,"tcppunch");t->local_port=local;t->remote_port=remote;t->tcp_v2=1;
+    assert(!op_addr_from_text(&t->peer_addr,"127.0.0.1",remote));
     start_underlay(c,ti);until=mono()+6*NS;
     while(t->state==T_TCP_CONNECT && t->listen_fd<0 && mono()<until){tick_tunnel(c,ti,mono());op_sleep_ms(2);}
     assert(t->state==T_TCP_CONNECT && t->listen_fd>=0 && t->fd<0 && t->tcp_attempts==1 && t->session_owner);
@@ -36,13 +38,13 @@ static void tcp_retry(void) {
 int main(void) {
     assert(!op_platform_init());tcp_retry();
     /* A difficult UDP mapping must never suppress a stable or unknown TCP path. */
-    fastp2p_client client={0};client.nat_type=NAT_HARD_SYM;client.tcp_nat.type=FP_NAT_STABLE;
+    fastp2p_client client={0};client.nat[OP_FAM_V4].type=NAT_HARD_SYM;client.tcp_nat.family[OP_FAM_V4].type=FP_NAT_STABLE;
     app rule={.transport=FASTP2P_TRANSPORT_TCP,.peer_nat=NAT_HARD_SYM,.peer_tcp_nat=FP_NAT_STABLE};
     assert(local_transport_nat(&client,rule.transport)==FP_NAT_STABLE);
     assert(peer_transport_nat(&rule)==FP_NAT_STABLE);
     assert(direct_rounds_allowed(nat_is_hard_sym(local_transport_nat(&client,rule.transport)),
                                 nat_is_hard_sym(peer_transport_nat(&rule)))==2);
-    client.tcp_nat.type=FP_NAT_UNKNOWN;rule.peer_tcp_nat=FP_NAT_UNKNOWN;
+    client.tcp_nat.family[OP_FAM_V4].type=FP_NAT_UNKNOWN;rule.peer_tcp_nat=FP_NAT_UNKNOWN;
     assert(!nat_is_hard_sym(local_transport_nat(&client,rule.transport)) && !nat_is_hard_sym(peer_transport_nat(&rule)));
     rule.transport=FASTP2P_TRANSPORT_QUIC;
     assert(local_transport_nat(&client,rule.transport)==NAT_HARD_SYM && peer_transport_nat(&rule)==NAT_HARD_SYM);
@@ -53,8 +55,34 @@ int main(void) {
     assert(punch_interval(9 * NS) == 200 * MS);
 
     /* Mapping classification. */
-    assert(nat_classify(40000, 40000, 0) == NAT_CONE);
-    assert(nat_classify(40000, 40001, 0) == NAT_HARD_SYM);
+    /* NAT1..NAT4 come from the mapping result plus the two filtering probes.
+     * A symmetric mapping is NAT4 whatever the filtering probes would say, and a
+     * cone mapping is only NAT1 when a foreign address actually got through. */
+    fastp2p_client levels = {0};
+    levels.nat[OP_FAM_V4].type = NAT_UNKNOWN;
+    assert(nat_level(&levels) == 0);
+    levels.nat[OP_FAM_V4].type = NAT_CONE;
+    assert(nat_level(&levels) == 5); /* nothing tested yet */
+    levels.filter_done = 1;
+    levels.filter.port_ok = -1;
+    assert(nat_level(&levels) == 5);
+    levels.filter.port_ok = 0;
+    assert(nat_level(&levels) == 3); /* a stranger's port was dropped */
+    levels.filter.port_ok = 1;
+    levels.filter.foreign_ok = -1;
+    assert(nat_level(&levels) == 5); /* no reflector available */
+    levels.filter.foreign_ok = 1;
+    assert(nat_level(&levels) == 1); /* a foreign address got through */
+    levels.filter.foreign_ok = 0;
+    assert(nat_level(&levels) == 2); /* known address, new port only */
+    for (int symmetric = NAT_HARD_SYM; symmetric <= NAT_EASY_SYM_DEC; ++symmetric) {
+        levels.nat[OP_FAM_V4].type = symmetric;
+        levels.filter.port_ok = 1;
+        levels.filter.foreign_ok = 1;
+        assert(nat_level(&levels) == 4); /* mapping decides; filtering is moot */
+    }
+
+    assert(nat_classify(40000, 40000, 0) == NAT_CONE);    assert(nat_classify(40000, 40001, 0) == NAT_HARD_SYM);
     assert(nat_classify(40000, 40001, 40000) == NAT_CONE);
     assert(nat_classify(40000, 41000, 40005) == NAT_EASY_SYM_INC);
     assert(nat_classify(40000, 41000, 39995) == NAT_EASY_SYM_DEC);

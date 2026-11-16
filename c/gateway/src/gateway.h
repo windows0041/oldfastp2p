@@ -20,8 +20,17 @@
 #define GW_LOGIN_MAX_ATTEMPTS 8u
 #define GW_LOGIN_FAIL_LOCK 5u
 #define GW_LOGIN_LOCK_MS 300000u
+/* DUALSTACK-SPEC §1: address-family capability bitmap. Only the two low bits
+ * are defined; a missing field in a legacy frame means "IPv4 only". */
+#define GW_FAMILY_V4 1u
+#define GW_FAMILY_V6 2u
+#define GW_FAMILY_BOTH (GW_FAMILY_V4 | GW_FAMILY_V6)
 struct login_attempt {
-    uint32_t address;         /* source IPv4 in network order, 0 = unused */
+    /* The key used to be a bare network-order IPv4. Login throttling must cover
+     * IPv6 sources too, so the key is now the family plus the address bytes
+     * (IPv4 in the first four). family 0 means the slot is unused. */
+    unsigned char address[16];
+    unsigned family;              /* AF_INET / AF_INET6, 0 = unused */
     uint64_t window_start;
     uint64_t locked_until;
     unsigned attempts, failures;
@@ -38,8 +47,16 @@ struct connection {
     uint64_t id, last_rx, relay_time, active_wall;
     uint64_t last_seen_wall, next_store;
     char hostname[256];
-    unsigned nat, bandwidth, has_ipv4, has_upnp, public_port, major;
+    /* families is the gateway-side view of DUALSTACK-SPEC §1: the observed WSS
+     * family is hard evidence, the client-reported bitmap may add the other. */
+    unsigned nat, bandwidth, has_ipv4, has_upnp, public_port, major, families, has_ipv6;
+    /* Full NAT1..NAT4 level from the inbound-filtering refinement (0 unknown,
+     * 5 = cone with untestable filtering). Kept apart from `nat`, which stays a
+     * pure mapping observation for the relay filter and for old peers. */
+    unsigned nat_level;
+    unsigned observed_family; /* GW_FAMILY_V4 / GW_FAMILY_V6 of this socket */
     unsigned tcp_nat, tcp_nat_samples, tcp_nat_ips;
+    unsigned nat6, tcp_nat6, tcp_nat6_samples, tcp_nat6_ips;
     struct packet *head, *tail;
     size_t queued, count;
     unsigned char *rx;
@@ -64,13 +81,20 @@ struct connection {
 };
 struct probe {
     int fd;
-    struct sockaddr_in peer;
+    /* Dual-stack: the accepted peer may be AF_INET or AF_INET6, so storage that
+     * fits either plus its length is required (the old sockaddr_in truncated a
+     * v6 peer address). */
+    struct sockaddr_storage peer;
+    socklen_t peer_length;
     uint64_t deadline;
     char output[128];
     size_t length, offset;
 };
 struct nat_state {
     int udp[4], tcp[2];
+    /* One independent set per family (SPEC §2). Only populated when the gateway
+     * was given an IPv6 bind address. */
+    int udp6[4], tcp6[2];
     struct probe probes[GW_MAX_PROBES];
     uint64_t second;
     unsigned packets;
@@ -82,12 +106,16 @@ struct gateway {
      * non-standard ports, so the same gateway is reachable on both. */
     struct lws_vhost *ws_alt_vhost;
     unsigned alt_ws_port;
+    /* Per-family vhosts: created only when --bind6 / --apibind6 were given, so a
+     * v4-only configuration behaves exactly as before. */
+    struct lws_vhost *ws_vhost6, *api_vhost6, *ws_alt_vhost6;
+    unsigned alt_ws6_port;
     lws_sorted_usec_list_t tick;
     struct connection *nodes[GW_MAX_NODES];
     uint64_t grants[GW_MAX_NODES][GW_MAX_NODES];
     size_t queued, rx_allocated;
     unsigned max_nodes, timeout, ws_port, api_port, run_seconds;
-    char bind[64], api_bind[64];
+    char bind[64], api_bind[64], bind6[64], api_bind6[64];
     const char *cert, *key, *user, *password;
     char secret[2048];
     struct gw_admin admin;
@@ -104,7 +132,8 @@ struct gateway {
     struct login_attempt logins[GW_LOGIN_SLOTS];
     struct nat_state nat;
 };
-int gw_nat_start(struct nat_state *state, const char *bind);
+/* bind6 may be NULL or empty: then no IPv6 probe sockets are created. */
+int gw_nat_start(struct nat_state *state, const char *bind, const char *bind6);
 void gw_nat_step(struct nat_state *state);
 void gw_nat_stop(struct nat_state *state);
 #endif
