@@ -2608,16 +2608,18 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                      * depend on the relay, so drop a link that is still not ready and
                      * let the app loop re-decide with the LAN path available. A link
                      * that already carries traffic is left alone. */
+                    /* Only after a direct attempt has actually failed: switching
+                     * earlier preempts the punch that would have succeeded, and in a
+                     * two-node topology there is no relay to fall back to. */
                     if (c->apps[i].peer_lan[0] && !c->apps[i].lan_tried &&
-                        lan_punch_possible(c, &c->apps[i])) {
+                        c->apps[i].attempts >= 1 && lan_punch_possible(c, &c->apps[i])) {
                         int index = c->apps[i].tunnel_index;
                         if (index >= 0 && c->tunnels[index].state &&
                             !c->tunnels[index].lan && !tunnel_ready(&c->tunnels[index]))
                             close_tunnel(c, index, "peer LAN address reachable; trying a direct LAN punch");
                         c->apps[i].tunnel_index = -1;
-                        /* The LAN path is only attempted while the round budget is
-                         * unspent, and earlier WAN attempts have spent it. Reset it
-                         * once: the lan_tried guard keeps this from looping. */
+                        /* The LAN branch needs an unspent round budget; it is taken at
+                         * most once because lan_tried is set when the punch starts. */
                         c->apps[i].attempts = 0;
                         c->apps[i].retry = mono();
                     }
@@ -3176,10 +3178,8 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
         if (t->state && t->tcp_v2 && t->fd < 0 && t->tcp_retry_at && now >= t->tcp_retry_at)
             tcp_punch_dial(c, ti, now);
         if (!t->state) return;
-        /* Completion first, deadline second. The non-blocking connect often finishes
-         * just as the attempt window closes; judging it by the deadline alone tore
-         * down connections that were still being established - every attempt then
-         * failed with EAGAIN even though both ends were listening. */
+        /* Completion first, deadline second: a connect that finishes as the window
+         * closes must count as success. */
         int rv = t->fd >= 0 ? connect_ready(t->fd) : 0;
         if (rv == 0 && t->tcp_v2 && t->fd >= 0 && now >= t->tcp_attempt_deadline) {
             errno = ETIMEDOUT;
@@ -3526,7 +3526,7 @@ static void tick_apps(fastp2p_client *c, uint64_t now) {
                     int rounds = direct_rounds_allowed(
                         nat_is_hard_sym(local_transport_nat(c, a->transport)),
                         nat_is_hard_sym(peer_transport_nat(a)));
-                    if (lan_punch_possible(c, a) && a->attempts < rounds && !c->force_relay) {
+                    if (lan_punch_possible(c, a) && !a->lan_tried && a->attempts < rounds && !c->force_relay) {
                         ++a->attempts;
                         ti = app_tunnel(c, a, a->peer, a->transport);
                         if (ti >= 0) {
