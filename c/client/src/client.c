@@ -1454,6 +1454,19 @@ static void probe_complete(fastp2p_client *c, int index) {
               t->lan ? c->local_ip[OP_FAM_V6] : t->mapped_text[OP_FAM_V6]);
         op_ju(j, "coneNatPort6", t->mapped_ports[OP_FAM_V6]);
     }
+    /* A LAN punch must hand the peer the port this client actually listens on:
+     * coneNatPort is the NAT mapping, which is a different port and is not open on
+     * the private address. New fields only, so a peer that does not understand
+     * them keeps using the public pair it already knows. */
+    if (t->lan) {
+        op_js(j, "fromIPLan", c->local_ip[OP_FAM_V4]);
+        op_ju(j, "lanPort", t->local_port);
+        char note[128];
+        snprintf(note, sizeof(note), "LAN punch advertising %s:%u (mapped port %u)",
+                 c->local_ip[OP_FAM_V4], (unsigned)t->local_port,
+                 (unsigned)t->mapped_ports[OP_FAM_V4]);
+        emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
+    }
     op_ju(j, "id", t->id);
     if (t->initiator) {
         op_js(j, "linkMode", t->mode);
@@ -1532,8 +1545,18 @@ static void tcp_punch_dial(fastp2p_client *c, int index, uint64_t now) {
     t->tcp_retry_at = 0;
     t->tcp_attempt_deadline = now + 3 * NS;
     t->fd = socket_bound(0, c->local_ip[t->family >= 0 ? t->family : OP_FAM_V4], t->local_port, 1);
-    char message[96];
-    snprintf(message, sizeof(message), "TCP punch connect attempt %u from the mapped source port", t->tcp_attempts);
+    /* Name the address actually dialled: the old wording claimed "the mapped
+     * source port" even on a LAN punch, which made a failed direct attempt
+     * impossible to tell apart from a NAT problem. */
+    char target[OP_ADDR_TEXT] = "?", local[OP_ADDR_TEXT] = "?";
+    op_addr shown = t->peer_addr; /* a copy: the tunnel's own address must not change */
+    op_addr_text(&shown, target, sizeof(target));
+    int family_index = t->family >= 0 ? t->family : OP_FAM_V4;
+    if (c->local_ip[family_index])
+        snprintf(local, sizeof(local), "%s", c->local_ip[family_index]);
+    char message[192];
+    snprintf(message, sizeof(message), "TCP punch connect attempt %u to %s from %s:%u%s",
+             t->tcp_attempts, target, local, (unsigned)t->local_port, t->lan ? " (LAN)" : "");
     emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, message);
     if (t->fd < 0 || (op_connect(t->fd, &t->peer_addr.u.sa, t->peer_addr.len) && errno != EINPROGRESS))
         tcp_punch_failed(c, index, now);
@@ -2391,6 +2414,21 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                     tunnel_learn_peer(t, peer_text6, port6);
                 t->server = op_integer(j, "isServer") != 0;
                 t->lan = op_integer(j, "lan") != 0;
+                if (t->lan) {
+                    /* The peer's private endpoint: its listening port, not the NAT
+                     * mapping it published for the public path. */
+                    const char *lan_text = op_string(j, "fromIPLan");
+                    uint64_t lan_port = op_integer(j, "lanPort");
+                    op_addr lan_address;
+                    if (lan_text && *lan_text && lan_port > 0 && lan_port <= 65535 &&
+                        !op_addr_from_text(&lan_address, lan_text, (uint16_t)lan_port) &&
+                        op_family_index(op_addr_family(&lan_address)) == OP_FAM_V4)
+                        tunnel_learn_peer(t, lan_text, (uint16_t)lan_port);
+                    char note[128];
+                    snprintf(note, sizeof(note), "LAN punch target %s:%llu",
+                             lan_text, (unsigned long long)lan_port);
+                    emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
+                }
                 if (udp && !strcmp(mode, "udp4") && t->server)
                     close_tunnel(c, ti, "direct UDP listener is not supported; use UDP punching");
                 else if (!udp && strcmp(mode, "tcppunch")) {
