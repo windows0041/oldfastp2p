@@ -63,6 +63,40 @@ def api(path, body=None, jwt=None, connection=None, timeout=3):
 
 GATEWAY_LOG = None
 
+def listening():
+    """Every TCP socket in LISTEN state, as the kernel reports it.
+
+    Deliberately dumb and exception-free: it runs while building an error message,
+    so it must never replace the real failure with its own."""
+    found = []
+    try:
+        for name in ('/proc/net/tcp', '/proc/net/tcp6'):
+            try:
+                rows = open(name, encoding='ascii', errors='replace').read().splitlines()[1:]
+            except OSError:
+                continue
+            for row in rows:
+                fields = row.split()
+                if len(fields) < 4 or fields[3] != '0A':  # 0A == LISTEN
+                    continue
+                address, _, port = fields[1].partition(':')
+                try:
+                    number = int(port, 16)
+                except ValueError:
+                    continue
+                try:
+                    packed = bytes.fromhex(address)
+                    if len(packed) == 4:
+                        host = '.'.join(str(part) for part in packed[::-1])
+                    else:
+                        host = address  # raw hex is enough to identify a v6 bind
+                except ValueError:
+                    host = address
+                found.append('%s:%d' % (host, number))
+    except Exception as error:  # never mask the timeout we are reporting
+        return ['<%s: %s>' % (type(error).__name__, error)]
+    return sorted(set(found))
+
 def log_tail(lines=25):
     if GATEWAY_LOG is None:
         return '(no gateway log was started)'
@@ -88,8 +122,8 @@ def wait(check, timeout=10, what='protocol integration step'):
         except (OSError,ValueError) as error:
             last = '%s: %s' % (type(error).__name__, error)
         time.sleep(.05)
-    raise TimeoutError('%s timed out after %ss; last attempt %s; gateway log tail:\n%s'
-                       % (what, timeout, last, log_tail()))
+    raise TimeoutError('%s timed out after %ss; last attempt %s; listening: %s; gateway log tail:\n%s'
+                       % (what, timeout, last, ', '.join(listening()) or 'none', log_tail()))
 
 def healthy():
     """The API answers /healthz with 200 once it is serving; anything else is a
