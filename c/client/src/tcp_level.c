@@ -8,8 +8,12 @@
 #define SO_REUSEPORT 0
 #endif
 
-#define FP_TCP_LEVEL_WAIT 3000 /* ms for the control connection to come up */
-#define FP_TCP_LEVEL_PROBE 4000 /* ms to wait for the callbacks */
+/* Deadlines share the client clock, which counts nanoseconds (client.c: MS is one
+ * millisecond), so every wait below is converted explicitly. */
+#define FP_NS_PER_MS UINT64_C(1000000)
+#define FP_TCP_LEVEL_CONNECT 3000 /* ms for the control connection */
+#define FP_TCP_LEVEL_PROBE 10000  /* ms: the server probes the callbacks one after another */
+
 /* Temporary tracing: FASTP2P_TCP_LEVEL_DEBUG=1 shows each transition. */
 static int tracing(void) {
     static int cached = -1;
@@ -17,7 +21,13 @@ static int tracing(void) {
         cached = getenv("FASTP2P_TCP_LEVEL_DEBUG") != NULL;
     return cached;
 }
-#define TRACE(...) do { if (tracing()) { fprintf(stderr, "tcp-level: " __VA_ARGS__); fputc(10, stderr); } } while (0)
+#define TRACE(...)                                                                     \
+    do {                                                                               \
+        if (tracing()) {                                                               \
+            fprintf(stderr, "tcp-level: " __VA_ARGS__);                                \
+            fputc(10, stderr);                                                         \
+        }                                                                              \
+    } while (0)
 
 static void reset(fp_tcp_level *state) {
     state->phase = 0;
@@ -36,6 +46,16 @@ void fp_tcp_level_close(fp_tcp_level *state) {
         op_close(state->dialer);
     state->listener = -1;
     state->dialer = -1;
+}
+
+static int shareable(op_socket fd) {
+    int on = 1;
+    op_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+#if defined(SO_REUSEPORT)
+    if (SO_REUSEPORT && op_setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on)))
+        return -1;
+#endif
+    return 0;
 }
 
 int fp_tcp_level_configure(fp_tcp_level *state, const char *text) {
@@ -64,7 +84,7 @@ int fp_tcp_level_configure(fp_tcp_level *state, const char *text) {
         return -1;
     /* A hostname is normal here, so resolve it: op_addr_from_text only parses
      * numeric literals. IPv4 is preferred because the probe server's callbacks
-     * come from addresses the caller configures by reachability. */
+     * come from addresses the operator configures for reachability. */
     struct addrinfo hints, *found = NULL, *cursor, *pick = NULL;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
@@ -85,7 +105,6 @@ int fp_tcp_level_configure(fp_tcp_level *state, const char *text) {
         freeaddrinfo(found);
         return -1;
     }
-    memset(&state->server, 0, sizeof(state->server));
     memcpy(&state->server.u.sa, pick->ai_addr, pick->ai_addrlen);
     state->server.len = pick->ai_addrlen;
     freeaddrinfo(found);
@@ -97,82 +116,52 @@ void fp_tcp_level_start(fp_tcp_level *state) {
         return;
     reset(state);
     int family = op_addr_family(&state->server);
-    /* Dial first and let the kernel pick the port, then listen on that same port.
-     * Binding the listener first makes the kernel steer the outbound SYN-ACK to
-     * the listener, and the connect never completes. */
     state->dialer = op_socket_open(family, SOCK_STREAM, 0);
-    if (state->dialer < 0) {
+    if (state->dialer < 0 || shareable(state->dialer)) {
+        fp_tcp_level_close(state);
         state->phase = 4;
         return;
     }
-    int on = 1;
-    op_setsockopt(state->dialer, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
-#if defined(SO_REUSEPORT)
-    if (SO_REUSEPORT)
-        op_setsockopt(state->dialer, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on));
-#endif
-    int connected = op_connect(state->dialer, &state->server.u.sa, state->server.len);
-    if (connected && errno != EINPROGRESS) {
+    /* Non-blocking connect; completion is the first thing step() waits for. The
+     * listener is created only after this succeeds - putting it on the same port
+     * beforehand lets the kernel steer the SYN-ACK to the listener and the
+     * connect then never completes. */
+    if (op_connect(state->dialer, &state->server.u.sa, state->server.len) &&
+        errno != EINPROGRESS) {
         TRACE("connect failed errno=%d", errno);
         fp_tcp_level_close(state);
         state->phase = 4;
         return;
     }
+    state->phase = 1;
+    state->deadline = 0;
+}
+
+/* Opens the listener on the port the outbound connection already occupies, so an
+ * inbound SYN for the NAT mapping can actually be accepted. */
+static int listen_here(fp_tcp_level *state) {
     op_addr local;
-    if (op_addr_socketname(state->dialer, &local)) {
-        fp_tcp_level_close(state);
-        state->phase = 4;
-        return;
-    }
+    if (op_addr_socketname(state->dialer, &local))
+        return -1;
     state->local_port = op_addr_port(&local);
+    int family = op_addr_family(&local);
     op_addr any;
     memset(&any, 0, sizeof(any));
     any.u.sa.sa_family = (unsigned short)family;
     any.len = family == AF_INET6 ? sizeof(any.u.in6) : sizeof(any.u.in);
     op_addr_set_port(&any, state->local_port);
-
     state->listener = op_socket_open(family, SOCK_STREAM, 0);
-    if (state->listener < 0) {
-        fp_tcp_level_close(state);
-        state->phase = 4;
-        return;
-    }
-    op_setsockopt(state->listener, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
-#if defined(SO_REUSEPORT)
-    if (SO_REUSEPORT)
-        op_setsockopt(state->listener, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on));
-#endif
-    if (op_bind(state->listener, &any.u.sa, any.len) || op_listen(state->listener, 4)) {
-        TRACE("listen failed on local port %u", (unsigned)state->local_port);
-        fp_tcp_level_close(state);
-        state->phase = 4;
-        return;
-    }
-    TRACE("dialing server family=%d local port %u connected=%d", family,
-          (unsigned)state->local_port, connected == 0);
-    state->phase = connected == 0 ? 2 : 1;
-    state->deadline = 0; /* starts counting on the first step */
-}
-
-/* Returns 1 when the control connection is usable, -1 on a hard failure. */
-static int dialing(fp_tcp_level *state, uint64_t now) {
-    op_pollfd item = {.fd = state->dialer, .events = POLLOUT, .revents = 0};
-    int ready = op_poll(&item, 1, 0);
-    if (ready <= 0) {
-        if (now > state->deadline) {
-            TRACE("connect timed out (revents=%d)", item.revents);
-            return -1;
-        }
-        return 0;
-    }
-    int error = 0;
-    op_socklen length = sizeof(error);
-    if (op_getsockopt(state->dialer, SOL_SOCKET, SO_ERROR, &error, &length) || error) {
-        TRACE("connect error %d (getsockopt rc=%d)", error,
-              op_getsockopt(state->dialer, SOL_SOCKET, SO_ERROR, &error, &length));
+    if (state->listener < 0 || shareable(state->listener))
+        return -1;
+    if (op_bind(state->listener, &any.u.sa, any.len)) {
+        TRACE("bind failed on port %u errno=%d", (unsigned)state->local_port, errno);
         return -1;
     }
-    return 1;
+    if (op_listen(state->listener, 4)) {
+        TRACE("listen failed on port %u errno=%d", (unsigned)state->local_port, errno);
+        return -1;
+    }
+    return 0;
 }
 
 static int read_line(fp_tcp_level *state) {
@@ -211,20 +200,36 @@ void fp_tcp_level_step(fp_tcp_level *state, uint64_t now) {
     if (state->phase == 0 || state->phase >= 4)
         return;
     if (!state->deadline)
-        state->deadline = now + FP_TCP_LEVEL_WAIT;
+        state->deadline = now + (uint64_t)FP_TCP_LEVEL_CONNECT * FP_NS_PER_MS;
 
     if (state->phase == 1) {
-        int ready = dialing(state, now);
-        if (ready < 0) {
+        op_pollfd item = {.fd = state->dialer, .events = POLLOUT, .revents = 0};
+        int ready = op_poll(&item, 1, 0);
+        if (ready <= 0) {
+            if (now > state->deadline) {
+                TRACE("connect timed out (revents=%d)", item.revents);
+                fp_tcp_level_close(state);
+                state->phase = 4;
+            }
+            return;
+        }
+        int error = 0;
+        op_socklen length = sizeof(error);
+        if (op_getsockopt(state->dialer, SOL_SOCKET, SO_ERROR, &error, &length) || error) {
+            TRACE("connect error %d", error);
             fp_tcp_level_close(state);
             state->phase = 4;
             return;
         }
-        if (!ready)
+        if (listen_here(state)) {
+            fp_tcp_level_close(state);
+            state->phase = 4;
             return;
-        TRACE("connected");
+        }
+        TRACE("connected, listening on %u", (unsigned)state->local_port);
         state->phase = 2;
-        state->deadline = now + FP_TCP_LEVEL_WAIT;
+        state->deadline = now + (uint64_t)FP_TCP_LEVEL_CONNECT * FP_NS_PER_MS;
+        return;
     }
 
     if (state->phase == 2) {
@@ -235,7 +240,6 @@ void fp_tcp_level_step(fp_tcp_level *state, uint64_t now) {
             return;
         }
         if (line > 0 && !strncmp(state->line, "mapped", 6)) {
-            /* The greeting proves the mapping exists; now ask for the callbacks. */
             static const char request[] = "probe\n";
             if (send(state->dialer, request, sizeof(request) - 1, MSG_DONTWAIT) <= 0) {
                 fp_tcp_level_close(state);
@@ -246,18 +250,19 @@ void fp_tcp_level_step(fp_tcp_level *state, uint64_t now) {
             state->phase = 3;
             state->used = 0;
             state->line[0] = 0;
-            state->deadline = now + FP_TCP_LEVEL_PROBE;
+            state->deadline = now + (uint64_t)FP_TCP_LEVEL_PROBE * FP_NS_PER_MS;
             return;
         }
         if (now > state->deadline) {
+            TRACE("no greeting, deadline hit");
             fp_tcp_level_close(state);
             state->phase = 4;
         }
         return;
     }
 
-    /* phase 3: collect whatever inbound SYNs the NAT let through, plus the
-     * server's report of which callbacks it managed to establish. */
+    /* phase 3: collect the inbound SYNs the NAT let through, plus the server's
+     * report of which callbacks it managed to establish. */
     for (;;) {
         op_addr from;
         memset(&from, 0, sizeof(from));
@@ -266,6 +271,7 @@ void fp_tcp_level_step(fp_tcp_level *state, uint64_t now) {
             break;
         op_close(peer);
         ++state->accepted;
+        TRACE("accepted callback %d", state->accepted);
     }
     int line = read_line(state);
     if (line < 0) {
