@@ -210,7 +210,11 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-config-sync-') as temporary:
                      timeout=40, what='the conflicting rule to be rolled back')
             results['bind_failure_rolls_back_without_losing_working_rules'] = True
 
-        if os.name == 'nt':
+        if args.fixture:
+            # The fixture never triggers a managed rewrite, so the profile is still
+            # the JSON this test wrote. DPAPI migration is asserted by identity_cli.py.
+            results['fixture_gateway_skips_dpapi_rewrite_check'] = True
+        elif os.name == 'nt':
             assert config.read_bytes().startswith(b'FPD1')
             assert env['FASTP2P_TOKEN'].encode() not in config.read_bytes()
             results['windows_DPAPI_retained_after_merge_reload_and_rollback'] = True
