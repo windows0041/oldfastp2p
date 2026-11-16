@@ -65,9 +65,21 @@ class GitHub:
             'Content-Type': content_type, 'User-Agent': 'FastP2P-release-builder'})
         class NoRedirect(urllib.request.HTTPRedirectHandler):
             def redirect_request(self, *args, **kwargs): return None
-        with urllib.request.build_opener(NoRedirect).open(request, timeout=180) as response:
-            content = response.read()
-            return json.loads(content) if content else None
+        try:
+            with urllib.request.build_opener(NoRedirect).open(request, timeout=180) as response:
+                content = response.read()
+                return json.loads(content) if content else None
+        except urllib.error.HTTPError as error:
+            # GitHub explains permission and rate-limit refusals in the body; without
+            # it a 403 in CI is indistinguishable from a dozen other causes.
+            try:
+                detail = error.read().decode('utf-8', 'replace')[:500]
+            except Exception:
+                detail = '(no body)'
+            raise urllib.error.HTTPError(
+                error.url, error.code,
+                '%s %s -> %s: %s' % (method, path, error.reason, detail),
+                error.headers, None) from None
 
 def publish(kind, files, repository, sha, ref, ref_type, run_id, token, explicit_tag=None):
     if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repository) or not re.fullmatch(r'[0-9a-f]{40}',sha) or not run_id.isdigit():
