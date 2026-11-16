@@ -3462,6 +3462,8 @@ static void tick_apps(fastp2p_client *c, uint64_t now) {
                                 start_punch(c, relay_index);
                         } else {
                             a->relay_requested = 1;
+                            emit(c, FASTP2P_EVENT_TUNNEL, 0, 0,
+                                 "relay requested from the gateway after a failed direct attempt");
                             json_object *j = json_object_new_object();
                             op_js(j, "peerNode", a->peer);
                             op_js(j, "underlayProtocol", a->transport == FASTP2P_TRANSPORT_TCP ? "tcp" : "quic");
