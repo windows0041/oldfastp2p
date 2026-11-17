@@ -66,6 +66,24 @@ static DWORD WINAPI control(DWORD code, DWORD event, void *data, void *context) 
     return ERROR_CALL_NOT_IMPLEMENTED;
 }
 
+/* The overlay is useless until the machine has an address and a resolver, and at boot
+ * the service is started long before DHCP and DNS settle: every early attempt fails and
+ * the retry ladder starts from a bad state. Wait until a minute of uptime has passed,
+ * which costs nothing on a manual start or an update restart later in the session.
+ * The wait is sliced so a STOP request is honoured at once instead of after a minute. */
+static int service_startup_delay(void) {
+    const ULONGLONG target = 60ULL * 1000ULL;
+    for (;;) {
+        ULONGLONG uptime = GetTickCount64();
+        if (uptime >= target)
+            return 0;
+        if (fastp2p_runtime_stopping())
+            return 1;
+        ULONGLONG left = target - uptime;
+        Sleep((DWORD)(left > 500 ? 500 : left));
+    }
+}
+
 static void WINAPI service_main(DWORD argc, LPWSTR *argv) {
     (void)argc;
     (void)argv;
@@ -74,6 +92,10 @@ static void WINAPI service_main(DWORD argc, LPWSTR *argv) {
         return;
     report(SERVICE_START_PENDING, 0);
     report(SERVICE_RUNNING, 0);
+    if (service_startup_delay()) {
+        report(SERVICE_STOPPED, 0);
+        return;
+    }
     int code = service_loop(service_argc, service_argv);
     report(SERVICE_STOPPED, (DWORD)code);
 }
