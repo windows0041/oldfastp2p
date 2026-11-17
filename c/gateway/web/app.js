@@ -465,6 +465,7 @@
       option.value = n.name; relay.append(option);
     }
     relay.value = app?.relayNode || '';
+      $('rule-no-relay').checked = !!app?.NoRelay;
     syncRuleFields();
     $('rule-dialog').showModal();
   }
@@ -530,6 +531,9 @@
         if (relay === app.peerNode) throw new Error('中继节点不能是对端节点本身。');
         if (relay === node.name) throw new Error('中继节点不能是本节点本身。');
         app.relayNode = relay;
+      // NoRelay travels inside the rule descriptor: the gateway
+      // carries unknown rule fields through to the client untouched.
+      app.NoRelay = $('rule-no-relay').checked;
       }
       if (!app.appName || app.peerNode === node.name ||
           (!socks && !app.dstHost)) throw new Error('请填写有效名称、对端节点' + (socks ? '' : '和目标地址') + '。');

@@ -199,6 +199,7 @@ typedef struct {
     uint16_t port, dst_port;
     int attempts, relay_wanted, relay_requested;
     int lan_tried; /* the LAN punch was already attempted for this rule */
+    int no_relay;  /* operator disabled relay fallback for this rule */
     /* Operator-chosen relay for this rule; empty means automatic. */
     char relay_node[32];
     uint64_t peer_nat, peer_tcp_nat, link_deadline;
@@ -2289,13 +2290,17 @@ static void apply_rule(fastp2p_client *c, json_object *j) {
                      * choice to the app it just created rather than widening the
                      * public ABI. */
                     const char *relay = op_string(j, "relayNode");
-                    if (*relay && valid_node(relay))
-                        for (int i = 0; i < NA; ++i)
-                            if (c->apps[i].used && c->apps[i].id == id) {
+                    /* Accept both spellings: the console sends NoRelay, while a rule
+                     * stored without a descriptor keeps the key as written by hand. */
+                    int no_relay = op_integer(j, "NoRelay") != 0 || op_integer(j, "noRelay") != 0;
+                    for (int i = 0; i < NA; ++i)
+                        if (c->apps[i].used && c->apps[i].id == id) {
+                            if (*relay && valid_node(relay))
                                 copy_string(c->apps[i].relay_node,
                                             sizeof(c->apps[i].relay_node), relay);
-                                break;
-                            }
+                            c->apps[i].no_relay = no_relay;
+                            break;
+                        }
                 }
             }
         } else if (src && src <= 65535 && dst && dst <= 65535) {
@@ -3568,8 +3573,19 @@ static void tick_apps(fastp2p_client *c, uint64_t now) {
                                     json_object_array_add(skip, json_object_new_string(a->relay_failed[k].node));
                                 json_object_object_add(j, "exclude", skip);
                             }
-                            ws_json(c, 5, 0, j);
-                            json_object_put(j);
+                            if (a->no_relay) {
+                                /* The operator disabled the relay for this rule, so do
+                                 * not ask for one: the session stays direct or fails
+                                 * with a clear reason instead of landing on a relay the
+                                 * operator does not want (for example one behind the
+                                 * same NAT, which cannot hairpin). */
+                                emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO,
+                                     "relay disabled for this rule; staying direct");
+                                a->relay_requested = 0;
+                            } else {
+                                ws_json(c, 5, 0, j);
+                                json_object_put(j);
+                            }
                         }
                     } else {
                         ++a->attempts;
