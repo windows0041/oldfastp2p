@@ -133,8 +133,14 @@ def publish(kind, files, repository, sha, ref, ref_type, run_id, token, explicit
         if uploaded.get('size') != file.stat().st_size or uploaded.get('digest') != 'sha256:' + digest(file):
             raise RuntimeError('GitHub asset checksum verification failed: ' + file.name)
         print('Uploaded:', file.name)
+    # GitHub has one "Latest" badge per repository and it belongs to the newest
+    # client. The gateway is a server component: publishing it must never take the
+    # badge away from the client release that users download.
+    newest = kind == 'client'
     release = api.request('/releases/' + str(release['id']),
-                          {'draft': False, 'prerelease': not stable, 'make_latest': 'true' if stable else 'false'}, method='PATCH')
+                          {'draft': False, 'prerelease': not stable,
+                           'make_latest': 'true' if stable and newest else 'false'},
+                          method='PATCH')
     print('Published:', release['html_url'])
     if not stable:
         prune_development_releases(api, prefix + '-dev-', keep=2)
