@@ -4073,17 +4073,27 @@ static void tick_nat_family(fastp2p_client *c, int family, uint64_t now) {
  * per-machine configuration. Both are still overridable, and `[]` / "" disables
  * the corresponding probe for an operator who does not want it to leave the host. */
 #define FP_DEFAULT_STUN_SERVERS "stun.fastp2p.top:3478"
+/* TCP filtering needs a callback probe server; same host, dedicated port. */
+#define FP_DEFAULT_TCP_NAT_PROBE "stun.fastp2p.top:3479"
 
 int fp_client_tcp_level_config(fastp2p_client *c, json_object *probe) {
     if (!c)
         return FASTP2P_OK;
-    const char *text = NULL;
     if (probe) {
         if (!json_object_is_type(probe, json_type_string))
             return FASTP2P_EINVAL;
-        text = json_object_get_string(probe);
+        const char *text = json_object_get_string(probe);
+        if (!*text) /* an empty string is an explicit opt-out */
+            return fp_tcp_level_configure(&c->tcp_level, NULL) < 0 ? FASTP2P_EINVAL
+                                                                  : FASTP2P_OK;
+        return fp_tcp_level_configure(&c->tcp_level, text) < 0 ? FASTP2P_EINVAL : FASTP2P_OK;
     }
-    return fp_tcp_level_configure(&c->tcp_level, text) < 0 ? FASTP2P_EINVAL : FASTP2P_OK;
+    /* No key: fall back to the built-in probe server so a node measures its TCP
+     * filtering without any per-machine configuration. Resolution happens when the
+     * probe starts, so a host without DNS to that name simply skips it. */
+    if (fp_tcp_level_configure(&c->tcp_level, FP_DEFAULT_TCP_NAT_PROBE) < 0)
+        fp_tcp_level_configure(&c->tcp_level, NULL);
+    return FASTP2P_OK;
 }/* Parses one "host:port" entry into slot `count`. Returns 0 on success. */
 static int stun_entry(fastp2p_client *c, const char *text, int count) {
     size_t length = strlen(text);
@@ -4786,7 +4796,9 @@ int fastp2p_client_step(fastp2p_client *c, unsigned wait_ms) {
     nat_stun_start(c);
     nat_stun_step(c, now);
     /* TCP filtering probe: same window, verdict arrives asynchronously. */
-    if (c->tcp_level.phase == 0 && c->tcp_level.server.len && c->ws && c->login_ok)
+    /* server.len is only known after the probe resolves its server, so the ports
+     * configured text is what says a probe is wanted. */
+    if (c->tcp_level.phase == 0 && c->tcp_level.server_port && c->ws && c->login_ok)
         fp_tcp_level_start(&c->tcp_level);
     fp_tcp_level_step(&c->tcp_level, now);
     /* Announce the outcome once, including "no verdict": the console has to be

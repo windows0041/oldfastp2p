@@ -82,17 +82,28 @@ int fp_tcp_level_configure(fp_tcp_level *state, const char *text) {
     }
     if (!port)
         return -1;
-    /* A hostname is normal here, so resolve it: op_addr_from_text only parses
-     * numeric literals. IPv4 is preferred because the probe server's callbacks
-     * come from addresses the operator configures for reachability. */
+    snprintf(state->host, sizeof(state->host), "%s", host);
+    state->server_port = port;
+    return 1;
+}
+
+void fp_tcp_level_start(fp_tcp_level *state) {
+    if (state->phase)
+        return;
+    reset(state);
+    /* Resolve now: a hostname is normal here, and doing it at config time made
+     * every client wait on DNS during startup. A failure just disables the probe. */
     struct addrinfo hints, *found = NULL, *cursor, *pick = NULL;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     char service[8];
-    snprintf(service, sizeof(service), "%u", (unsigned)port);
-    if (getaddrinfo(host, service, &hints, &found) || !found)
-        return -1;
+    snprintf(service, sizeof(service), "%u", (unsigned)state->server_port);
+    if (getaddrinfo(state->host, service, &hints, &found) || !found) {
+        TRACE("cannot resolve %s", state->host);
+        state->phase = 4;
+        return;
+    }
     for (cursor = found; cursor; cursor = cursor->ai_next)
         if (cursor->ai_family == AF_INET) {
             pick = cursor;
@@ -103,18 +114,14 @@ int fp_tcp_level_configure(fp_tcp_level *state, const char *text) {
             pick = cursor;
     if (!pick || pick->ai_addrlen > sizeof(state->server.u)) {
         freeaddrinfo(found);
-        return -1;
+        state->phase = 4;
+        return;
     }
+    memset(&state->server, 0, sizeof(state->server));
     memcpy(&state->server.u.sa, pick->ai_addr, pick->ai_addrlen);
     state->server.len = pick->ai_addrlen;
     freeaddrinfo(found);
-    return 1;
-}
 
-void fp_tcp_level_start(fp_tcp_level *state) {
-    if (state->phase)
-        return;
-    reset(state);
     int family = op_addr_family(&state->server);
     state->dialer = op_socket_open(family, SOCK_STREAM, 0);
     if (state->dialer < 0 || shareable(state->dialer)) {

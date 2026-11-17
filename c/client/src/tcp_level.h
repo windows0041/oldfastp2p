@@ -22,7 +22,9 @@
  * caller, which already measures the mapping. */
 typedef struct {
     int phase; /* 0 idle, 1 connecting, 2 greeting, 3 probing, 4 done */
-    op_addr server;
+    op_addr server;    /* resolved when the probe starts */
+    char host[254];    /* configured text, resolved in start() */
+    uint16_t server_port;
     op_socket listener, dialer;
     uint16_t local_port;
     uint64_t deadline;
