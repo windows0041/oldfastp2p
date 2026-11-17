@@ -28,8 +28,18 @@ void fastp2p_console_prepare(int argc, char **argv) {
         return;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--")) break;
-        if (!strcmp(argv[i], "--background") || !strcmp(argv[i], "-background") || !strcmp(argv[i], "-b"))
+        if (!strcmp(argv[i], "--background") || !strcmp(argv[i], "-background") || !strcmp(argv[i], "-b")) {
+            /* Started by the logon Run key. Windows allocates a console for a console
+             * binary and this mode never needs one, so drop it - otherwise a black
+             * window stays on screen for as long as the client runs. A start made with
+             * CREATE_NO_WINDOW (the installer) has no console, so this is a no-op. */
+            if (FreeConsole()) {
+                (void)freopen("NUL", "r", stdin);
+                (void)freopen("NUL", "w", stdout);
+                (void)freopen("NUL", "w", stderr);
+            }
             return;
+        }
     }
     /* Capture CRT state before attaching: AttachConsole may replace Win32
      * standard handles. Preserve inherited pipes/files used by CLI automation. */
