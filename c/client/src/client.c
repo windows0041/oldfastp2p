@@ -4657,6 +4657,7 @@ int fastp2p_client_add_socks5(fastp2p_client *c, const fastp2p_socks5 *p, uint64
         if (c->apps[i].used && c->apps[i].id == aid) {
             app *a = &c->apps[i];
             a->socks = 1;
+            a->no_relay = p->struct_size >= sizeof(*p) ? (p->no_relay != 0) : 0;
             a->destination[0] = 0;
             a->dst_port = 0;
             strcpy(a->socks_user, user);

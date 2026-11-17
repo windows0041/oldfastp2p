@@ -190,7 +190,9 @@ static int create_json(const char *text, const char *token_text, const char *ca,
                                                                     : FASTP2P_TRANSPORT_QUIC,
                              .username = op_string(p, "Username"),
                              .password = password,
-                             .relay_node = op_string(p,"RelayNode")};
+                             .relay_node = op_string(p,"RelayNode"),
+                             .no_relay = (op_integer(p,"NoRelay") != 0 ||
+                                          op_integer(p,"noRelay") != 0) ? 1 : 0};
         rv = fastp2p_client_add_socks5(*out, &proxy, NULL);
     }
     json_object_put(root);

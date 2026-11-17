@@ -7,7 +7,7 @@ extern "C" {
 #endif
 
 #define FASTP2P_ABI_VERSION 1u
-#define FASTP2P_VERSION "2.0.13"
+#define FASTP2P_VERSION "2.0.14"
 #if defined(_WIN32) && !defined(FASTP2P_STATIC)
 #if defined(FASTP2P_BUILDING_LIBRARY)
 #define FASTP2P_API __declspec(dllexport)
@@ -98,6 +98,7 @@ typedef struct {
     const char *username; /* NULL/empty and password empty = no authentication. */
     const char *password; /* If supplied, both strings must be 1..255 bytes. */
     const char *relay_node; /* Optional; appended compatibly to ABI 1. */
+    int no_relay;           /* Optional; 1 = never fall back to a relay. */
 } fastp2p_socks5;
 
 /* All functions for an instance are called on one owning thread. No worker
