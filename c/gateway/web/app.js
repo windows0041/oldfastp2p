@@ -458,14 +458,18 @@
     const relay = $('rule-relay');
     relay.replaceChildren(element('option', null, '自动选择（按 NAT 质量）'));
     relay.firstChild.value = '';
+    // An explicit opt-out lives in the same list: a rule that cannot use a
+    // relay (for example both ends behind one NAT) picks this instead.
+    const noneOption = element('option', null, '无需中继（只走打洞直连）');
+    noneOption.value = '__no_relay__';
+    relay.append(noneOption);
     for (const n of state.nodes) {
       if (n.name === state.selected.name) continue;
       const option = element('option', null,
         `${n.name}（UDP：${udpLevel(n)} / TCP：${tcpMapping(n.tcpNatType)}）`);
       option.value = n.name; relay.append(option);
     }
-    relay.value = app?.relayNode || '';
-      $('rule-no-relay').checked = !!app?.NoRelay;
+    relay.value = app?.NoRelay ? '__no_relay__' : (app?.relayNode || '');
     syncRuleFields();
     $('rule-dialog').showModal();
   }
@@ -531,9 +535,9 @@
         if (relay === app.peerNode) throw new Error('中继节点不能是对端节点本身。');
         if (relay === node.name) throw new Error('中继节点不能是本节点本身。');
         app.relayNode = relay;
-      // NoRelay travels inside the rule descriptor: the gateway
-      // carries unknown rule fields through to the client untouched.
-      app.NoRelay = $('rule-no-relay').checked;
+      // NoRelay travels inside the rule descriptor: the gateway carries
+      // unknown rule fields through to the client untouched.
+      if (relay === '__no_relay__') { app.NoRelay = true; app.relayNode = ''; }
       }
       if (!app.appName || app.peerNode === node.name ||
           (!socks && !app.dstHost)) throw new Error('请填写有效名称、对端节点' + (socks ? '' : '和目标地址') + '。');
